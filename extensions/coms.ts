@@ -124,6 +124,25 @@ interface InboundContext {
 	fulfilled: boolean;
 }
 
+// Find the entry that initiated the most recent turn: the last branch entry
+// that is a real user message or an injected custom_message (e.g. coms-inbound).
+// Assistant and toolResult entries are turn *output*, never initiators, so they
+// are skipped. Returns null if no initiator is found.
+//
+// This is the linchpin of correct auto-reply: a turn should only reply to coms
+// when it was actually triggered by an inbound coms message — not merely because
+// an inbound happens to be sitting in the queue while some other turn (e.g. a
+// proactive self-investigation) completes.
+function findTurnInitiator(branch: any[]): any | null {
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const e = branch[i];
+		if (e.type === "custom_message") return e;
+		if (e.type === "message" && e.message?.role === "user") return e;
+		// assistant / toolResult are turn output — keep walking back
+	}
+	return null;
+}
+
 // ━━ Helpers ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -620,11 +639,10 @@ export default function (pi: ExtensionAPI) {
 		};
 		inboundQueue.set(env.msg_id, inbound);
 
-		// 3. Track the current inbound so that any coms_send issued during the
-		//    resulting LLM turn inherits the right hop count.
-		currentInbound = inbound;
-
-		// 4. Inject as a follow-up message into the receiver's next turn.
+		// 3. Inject as a follow-up message into the receiver's next turn.
+		//    We do NOT arm `currentInbound` here: the inbound may sit queued while an
+		//    unrelated turn runs. It is armed in `agent_start` for the specific turn
+		//    that this coms-inbound message actually initiates.
 		try {
 			pi.sendMessage(
 				{
@@ -642,12 +660,11 @@ export default function (pi: ExtensionAPI) {
 		} catch (err) {
 			// If sendMessage fails, drop the inbound and nack.
 			inboundQueue.delete(env.msg_id);
-			currentInbound = null;
 			nack(socket, env.msg_id, "internal error");
 			return;
 		}
 
-		// 5. Ack + audit log
+		// 4. Ack + audit log
 		ackOk(socket, env.msg_id);
 		try {
 			pi.appendEntry("coms-log", {
@@ -1036,12 +1053,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (rows.length === 0) {
-			const emptyMsg = theme.fg("muted", "no peers connected");
-			return [
-				topBorder,
-				truncateToWidth(theme.fg("dim", " ") + emptyMsg, width),
-				bottomBorder,
-			];
+			return [];
 		}
 
 		rows.sort((a, b) => a.name.localeCompare(b.name));
@@ -1475,15 +1487,52 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// ━━ agent_start: arm currentInbound for the turn this run executes ━━━
+	// A turn inherits hop count from the inbound that initiated it. We arm it here
+	// (not at queue time) so it tracks the specific turn actually running, and so
+	// proactive non-coms turns correctly originate fresh traffic (hops = 0).
+
+	pi.on("agent_start", async (_event, ctx) => {
+		if (!identity) return;
+		const initiator = findTurnInitiator(ctx.sessionManager.getBranch());
+		if (initiator?.type === "custom_message" && initiator.customType === "coms-inbound") {
+			const msgId: string | undefined = initiator.details?.msg_id;
+			const inbound = msgId ? inboundQueue.get(msgId) : undefined;
+			currentInbound = inbound && !inbound.fulfilled ? inbound : null;
+		} else {
+			currentInbound = null;
+		}
+	});
+
 	// ━━ agent_end: capture turn output and dispatch response back ━━━━━━━━
+	// Only replies when the just-completed turn was actually initiated by an
+	// inbound coms message. A turn triggered by anything else (the agent's own
+	// proactive investigation, a user prompt) never auto-replies, even if an
+	// unrelated inbound is sitting in the queue.
 
 	pi.on("agent_end", async (_event, ctx) => {
-		const inbound = [...inboundQueue.values()].reverse().find((i) => !i.fulfilled);
-		if (!inbound || !identity) return;
+		if (!identity) return;
 
-		// Walk the session branch for the most recent assistant message text.
+		const branch = ctx.sessionManager.getBranch();
+		const initiator = findTurnInitiator(branch);
+		if (initiator?.type !== "custom_message" || initiator.customType !== "coms-inbound") {
+			return; // this turn wasn't triggered by a coms message
+		}
+
+		const msgId: string | undefined = initiator.details?.msg_id;
+		if (!msgId) return;
+		const inbound = inboundQueue.get(msgId);
+		if (!inbound || inbound.fulfilled) return;
+
+		// Capture the assistant text produced *after* the initiating message —
+		// i.e. this turn's output, not some earlier turn's leftover text.
 		let lastAssistantText = "";
-		for (const entry of ctx.sessionManager.getBranch()) {
+		let seenInitiator = false;
+		for (const entry of branch) {
+			if (!seenInitiator) {
+				if (entry.id === initiator.id) seenInitiator = true;
+				continue;
+			}
 			if (entry.type === "message" && entry.message.role === "assistant") {
 				const m = entry.message as any;
 				if (typeof m.content === "string") {
@@ -1595,4 +1644,5 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => { await cleanShutdown(); });
 	process.on("SIGINT", () => { void cleanShutdown(); });
 	process.on("SIGTERM", () => { void cleanShutdown(); });
+	process.on("SIGHUP", () => { void cleanShutdown(); });
 }
