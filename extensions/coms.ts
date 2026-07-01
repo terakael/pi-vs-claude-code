@@ -12,9 +12,10 @@
  */
 
 import type { ExtensionAPI, ExtensionContext, Theme } from "@mariozechner/pi-coding-agent";
-import { DynamicBorder } from "@mariozechner/pi-coding-agent";
-import { Text, Container, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
+import { CustomEditor, DynamicBorder } from "@mariozechner/pi-coding-agent";
+import { Key, Text, Container, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import type { AutocompleteItem } from "@mariozechner/pi-tui";
+import { spawnSync } from "node:child_process";
 import { Type } from "@sinclair/typebox";
 import { applyExtensionDefaults } from "./themeMap.ts";
 import * as net from "node:net";
@@ -93,6 +94,9 @@ interface RegistryEntry {
 	context_used_pct?: number;
 	queue_depth?: number;
 	heartbeat_at?: string;
+	tmux_session?: string;
+	tmux_window?: string;
+	tmux_pane?: string;
 }
 
 // Minimal context for the currently-running coms-initiated turn — used only
@@ -524,6 +528,59 @@ function readFrontmatterFromArgv(argv: string[]): { name?: string; description?:
 	}
 }
 
+// ━━ Keyboard-navigable pool (CustomEditor subclass) ━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class ComsNavEditor extends CustomEditor {
+	constructor(
+		private _tui: any,
+		theme: any,
+		keybindings: any,
+		private getRows: () => string[],
+		private getSelected: () => number,
+		private setSelected: (n: number) => void,
+		private onNavigate: (name: string) => void,
+	) {
+		super(_tui, theme, keybindings);
+	}
+
+	override handleInput(data: string): void {
+		const rows = this.getRows();
+		const sel = this.getSelected();
+
+		if (matchesKey(data, Key.ctrl("n"))) {
+			if (rows.length > 0) {
+				this.setSelected(sel >= rows.length - 1 ? -1 : sel + 1);
+				this._tui.requestRender();
+			}
+			return;
+		}
+
+		if (matchesKey(data, Key.ctrl("p"))) {
+			if (rows.length > 0) {
+				this.setSelected(sel === -1 ? rows.length - 1 : sel - 1);
+				this._tui.requestRender();
+			}
+			return;
+		}
+
+		if (matchesKey(data, Key.enter) && sel >= 0) {
+			const name = rows[sel];
+			if (name) this.onNavigate(name);
+			this.setSelected(-1);
+			this._tui.requestRender();
+			return;
+		}
+
+		if (matchesKey(data, Key.escape) && sel >= 0) {
+			this.setSelected(-1);
+			this._tui.requestRender();
+			return;
+		}
+
+		super.handleInput(data);
+	}
+}
+
 // ━━ Default export ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 export default function (pi: ExtensionAPI) {
@@ -569,6 +626,9 @@ export default function (pi: ExtensionAPI) {
 		model: string;
 		endpoint: string;
 		registryFile: string;
+		tmux_session?: string;
+		tmux_window?: string;
+		tmux_pane?: string;
 	} | null = null;
 	const peerCards: Map<string, AgentCard & { staleCount: number }> = new Map();
 	let server: net.Server | null = null;
@@ -578,6 +638,7 @@ export default function (pi: ExtensionAPI) {
 	let displayProject: string | null = null;
 	let currentCtx: ExtensionContext | null = null;
 	let currentInbound: InboundContext | null = null;
+	let selectedIndex = -1;
 
 	// Phase A stub handlers — each just acks valid envelopes. Phase B replaces these.
 	function ackOk(socket: net.Socket, msg_id: string): void {
@@ -756,6 +817,19 @@ export default function (pi: ExtensionAPI) {
 		const cwd = ctx.cwd || process.cwd();
 		const model = ctx.model?.id ?? "unknown";
 
+		// Detect tmux location — stored in registry so peers can navigate here.
+		let tmuxSession: string | undefined;
+		let tmuxWindow: string | undefined;
+		const tmuxPane = process.env.TMUX_PANE || undefined;
+		if (tmuxPane) {
+			try {
+				const rs = spawnSync("tmux", ["display-message", "-p", "-t", tmuxPane, "#S"], { encoding: "utf-8" });
+				const rw = spawnSync("tmux", ["display-message", "-p", "-t", tmuxPane, "#W"], { encoding: "utf-8" });
+				if (rs.status === 0) tmuxSession = rs.stdout.trim() || undefined;
+				if (rw.status === 0) tmuxWindow = rw.stdout.trim() || undefined;
+			} catch { /* tmux unavailable */ }
+		}
+
 		// 2. Ensure storage dirs exist.
 		try {
 			fs.mkdirSync(path.join(COMS_DIR, "projects", project, "agents"), { recursive: true });
@@ -789,6 +863,9 @@ export default function (pi: ExtensionAPI) {
 			started_at: nowIso(),
 			explicit,
 			version: 1,
+			tmux_session: tmuxSession,
+			tmux_window: tmuxWindow,
+			tmux_pane: tmuxPane,
 		};
 		let registryFile: string;
 		try {
@@ -810,6 +887,9 @@ export default function (pi: ExtensionAPI) {
 			model,
 			endpoint,
 			registryFile,
+			tmux_session: tmuxSession,
+			tmux_window: tmuxWindow,
+			tmux_pane: tmuxPane,
 		};
 		includeExplicit = false;
 		displayProject = project;
@@ -828,6 +908,15 @@ export default function (pi: ExtensionAPI) {
 		try {
 			ctx.ui.setStatus("coms", `📡 ${name}@${project}`);
 			installPoolWidget(ctx);
+			ctx.ui.setEditorComponent((tui, theme, kb) =>
+				new ComsNavEditor(
+					tui, theme, kb,
+					() => buildPoolRows().map((r) => r.name),
+					() => selectedIndex,
+					(n) => { selectedIndex = n; },
+					navigateToAgent,
+				),
+			);
 			ctx.ui.notify(
 				`📡 coms ready · ${name}@${project} · ${displayProject ?? project} pool`,
 				"info",
@@ -860,6 +949,9 @@ export default function (pi: ExtensionAPI) {
 					version: 1,
 					context_used_pct: Math.round(ctx?.getContextUsage()?.percent ?? 0),
 					heartbeat_at: nowIso(),
+					tmux_session: identity.tmux_session,
+					tmux_window: identity.tmux_window,
+					tmux_pane: identity.tmux_pane,
 				};
 				// Unconditional atomic write: handles BOTH the live-status refresh
 				// (file present → overwrite with fresh values) AND self-heal (file
@@ -905,23 +997,24 @@ export default function (pi: ExtensionAPI) {
 		return null;
 	}
 
-	// ━━ Pool widget rendering ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-	function renderPool(width: number, theme: Theme): string[] {
+	// ━━ Pool rows (shared between renderPool and the nav editor) ━━━━━━━━━━━━
+	interface PoolRow {
+		name: string;
+		model: string;
+		color: string;
+		purpose: string;
+		pct: number | null;
+		pending: boolean;
+		stale: boolean;
+	}
+
+	function buildPoolRows(): PoolRow[] {
 		const projectFilter = displayProject ?? identity?.project ?? "default";
 		const registryEntries = projectFilter === "*"
 			? readAllRegistryEntriesAcrossProjects()
 			: readAllRegistryEntries(projectFilter);
 
-		interface Row {
-			name: string;
-			model: string;
-			color: string;
-			purpose: string;
-			pct: number | null;
-			pending: boolean;
-			stale: boolean;
-		}
-		const rows: Row[] = [];
+		const rows: PoolRow[] = [];
 		const seenSessions = new Set<string>();
 
 		for (const [sid, card] of peerCards.entries()) {
@@ -938,7 +1031,6 @@ export default function (pi: ExtensionAPI) {
 			});
 		}
 
-		// Registry-only entries that aren't yet in peerCards → pending
 		const seenNames = new Set(rows.map((r) => r.name));
 		for (const entry of registryEntries) {
 			if (identity && entry.session_id === identity.session_id) continue;
@@ -955,6 +1047,75 @@ export default function (pi: ExtensionAPI) {
 				stale: false,
 			});
 		}
+
+		rows.sort((a, b) => a.name.localeCompare(b.name));
+		return rows;
+	}
+
+	function navigateToAgent(name: string): void {
+		if (!identity) return;
+		const target = resolveTarget(name);
+
+		const pane = target?.tmux_pane;
+
+		if (pane) {
+			// pane_id is globally unique — select-pane handles same-window,
+			// same-session-different-window, and (with switch-client) cross-session.
+			try {
+				// Cross-session: switch to the session containing the pane first.
+				const info = spawnSync(
+					"tmux", ["display-message", "-p", "-t", pane, "#{session_name}:#{window_index}"],
+					{ encoding: "utf-8" },
+				);
+				if (info.status === 0 && info.stdout.trim()) {
+					spawnSync("tmux", ["switch-client", "-t", info.stdout.trim()], { encoding: "utf-8" });
+				}
+				// Select the specific pane (works for same-window and cross-window).
+				const r = spawnSync("tmux", ["select-pane", "-t", pane], { encoding: "utf-8" });
+				if (r.status !== 0) {
+					currentCtx?.ui?.notify?.(`coms: can't select pane for ${name}`, "error");
+				}
+			} catch {
+				currentCtx?.ui?.notify?.("coms: tmux not available", "error");
+			}
+			return;
+		}
+
+		// No pane ID — fall back to session:window or window-name scan.
+		let tmuxTarget: string | undefined;
+
+		if (target?.tmux_session) {
+			tmuxTarget = `${target.tmux_session}:${target.tmux_window ?? name}`;
+		} else {
+			try {
+				const list = spawnSync(
+					"tmux", ["list-windows", "-a", "-F", "#{session_name}:#{window_name}"],
+					{ encoding: "utf-8" },
+				);
+				if (list.status === 0) {
+					tmuxTarget = list.stdout.trim().split("\n").find((l) => l.endsWith(`:${name}`));
+				}
+			} catch { /* tmux not available */ }
+		}
+
+		if (!tmuxTarget) {
+			currentCtx?.ui?.notify?.(`coms: no tmux location found for ${name}`, "error");
+			return;
+		}
+
+		try {
+			const result = spawnSync("tmux", ["switch-client", "-t", tmuxTarget], { encoding: "utf-8" });
+			if (result.status !== 0) {
+				currentCtx?.ui?.notify?.(`coms: can't navigate to ${name}`, "error");
+			}
+		} catch {
+			currentCtx?.ui?.notify?.("coms: tmux not available", "error");
+		}
+	}
+
+	// ━━ Pool widget rendering ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+	function renderPool(width: number, theme: Theme): string[] {
+		const rows = buildPoolRows();
 
 		// Border helpers — sandwich the body with single-line box-drawing rules
 		// so the widget reads as its own block above the minimal footer. The
@@ -992,11 +1153,13 @@ export default function (pi: ExtensionAPI) {
 			return [];
 		}
 
-		rows.sort((a, b) => a.name.localeCompare(b.name));
-
+		// rows already sorted by buildPoolRows()
+		const effectiveSel = selectedIndex < rows.length ? selectedIndex : -1;
 		const out: string[] = [topBorder];
 
-		for (const r of rows) {
+		for (let i = 0; i < rows.length; i++) {
+			const r = rows[i]!;
+			const isSelected = i === effectiveSel;
 			const pctNum = r.pct ?? 0;
 			const filled = Math.max(0, Math.min(15, Math.round((pctNum / 100) * 15)));
 			const empty = 15 - filled;
@@ -1004,7 +1167,8 @@ export default function (pi: ExtensionAPI) {
 
 			if (r.stale) {
 				const dimRow = `✗ ${r.name.padEnd(12)} ${abbreviateModel(r.model).padEnd(14)} [${"-".repeat(15)}] ${pctLabel.padStart(4)}  —  ${r.purpose || ""}`;
-				out.push(truncateToWidth(" " + theme.fg("dim", dimRow), width));
+				const truncated = truncateToWidth(" " + theme.fg("dim", dimRow), width);
+				out.push(isSelected ? theme.bg("selectedBg", truncated) : truncated);
 				continue;
 			}
 
@@ -1019,8 +1183,9 @@ export default function (pi: ExtensionAPI) {
 			const sep = theme.fg("dim", "  —  ");
 			const purposePart = theme.fg("muted", r.purpose || "");
 
-			const line = " " + swatch + " " + namePart + " " + modelPart + " " + bar + pctPart + sep + purposePart;
-			out.push(truncateToWidth(line, width));
+			const rawLine = " " + swatch + " " + namePart + " " + modelPart + " " + bar + pctPart + sep + purposePart;
+			const truncated = truncateToWidth(rawLine, width);
+			out.push(isSelected ? theme.bg("selectedBg", truncated) : truncated);
 		}
 
 		out.push(bottomBorder);
@@ -1296,6 +1461,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_start", async (_event, ctx) => {
 		if (!identity) return;
+		selectedIndex = -1;
 		const initiator = findTurnInitiator(ctx.sessionManager.getBranch());
 		if (initiator?.type === "custom_message" && initiator.customType === "coms-inbound") {
 			currentInbound = {
@@ -1349,7 +1515,9 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (currentCtx?.hasUI) {
 			try { currentCtx.ui.setWidget("coms-pool", undefined); } catch { /* ignore */ }
+			try { currentCtx.ui.setEditorComponent(undefined); } catch { /* ignore */ }
 		}
+		selectedIndex = -1;
 	}
 
 	pi.on("session_shutdown", async () => { await cleanShutdown(); });
