@@ -6,9 +6,7 @@
  * ~/.pi/coms/projects/<project>/agents/<name>.json.
  *
  * Phase A (foundation): identity resolution, registry I/O, transport bind/send,
- * connection handlers. Phase B: tools (coms_list/send/get/await), agent_end
- * response capture. Phase C: live pool widget, ping + keepalive cycles, /coms
- * slash command, clean shutdown lifecycle.
+ * connection handlers.
  *
  * Usage: pi -e extensions/coms.ts
  */
@@ -41,7 +39,7 @@ const FALLBACK_PALETTE = [
 
 // ━━ Types ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-type EnvelopeType = "prompt" | "response" | "ping";
+type EnvelopeType = "prompt" | "ping";
 
 interface Envelope {
 	type: EnvelopeType;
@@ -58,13 +56,6 @@ interface PromptEnvelope extends Envelope {
 	sender_name: string;
 	sender_cwd: string;
 	conversation_id?: string | null;
-	response_schema?: object | null;
-}
-
-interface ResponseEnvelope extends Envelope {
-	type: "response";
-	response: any;
-	error?: string | null;
 }
 
 interface PingEnvelope extends Envelope {
@@ -77,7 +68,6 @@ interface AgentCard {
 	model: string;
 	color: string;
 	context_used_pct: number;
-	queue_depth: number;
 }
 
 interface Pong {
@@ -105,23 +95,12 @@ interface RegistryEntry {
 	heartbeat_at?: string;
 }
 
-interface PendingReply {
-	resolve: (value: any) => void;
-	reject: (err: Error) => void;
-	timer: NodeJS.Timeout | null;
-	promise: Promise<{ response?: any; error?: string | null }>;
-	result?: { response?: any; error?: string | null };
-	target_name?: string;
-	created_at: string;
-}
-
+// Minimal context for the currently-running coms-initiated turn — used only
+// for hop-count inheritance so outbound sends from within that turn increment
+// the counter correctly.
 interface InboundContext {
 	msg_id: string;
 	hops: number;
-	sender_endpoint: string;
-	sender_session: string;
-	response_schema?: object | null;
-	fulfilled: boolean;
 }
 
 // Find the entry that initiated the most recent turn: the last branch entry
@@ -592,8 +571,6 @@ export default function (pi: ExtensionAPI) {
 		registryFile: string;
 	} | null = null;
 	const peerCards: Map<string, AgentCard & { staleCount: number }> = new Map();
-	const pendingReplies: Map<string, PendingReply> = new Map();
-	const inboundQueue: Map<string, InboundContext> = new Map();
 	let server: net.Server | null = null;
 	let pingTimer: NodeJS.Timeout | null = null;
 	let keepaliveTimer: NodeJS.Timeout | null = null;
@@ -628,78 +605,38 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// 2. Insert into inbound queue
-		const inbound: InboundContext = {
-			msg_id: env.msg_id,
-			hops: env.hops,
-			sender_endpoint: env.sender_endpoint,
-			sender_session: env.sender_session,
-			response_schema: env.response_schema ?? null,
-			fulfilled: false,
-		};
-		inboundQueue.set(env.msg_id, inbound);
-
-		// 3. Inject as a follow-up message into the receiver's next turn.
-		//    We do NOT arm `currentInbound` here: the inbound may sit queued while an
-		//    unrelated turn runs. It is armed in `agent_start` for the specific turn
-		//    that this coms-inbound message actually initiates.
+		// Steer the receiver immediately. hops is stored in details so agent_start
+		// can arm currentInbound for hop-count inheritance.
 		try {
 			pi.sendMessage(
 				{
 					customType: "coms-inbound",
-					content: `[from ${env.sender_name} @ ${env.sender_cwd}]\n\n${env.prompt}`,
+					content: `[coms · from ${env.sender_name} · reply via coms_send target="${env.sender_name}" when done]\n\n${env.prompt}`,
 					display: true,
 					details: {
 						msg_id: env.msg_id,
-						sender_session: env.sender_session,
-						response_schema: env.response_schema ?? null,
+						hops: env.hops,
+						sender_name: env.sender_name,
 					},
 				},
 				{ deliverAs: "followUp", triggerTurn: true },
 			);
 		} catch (err) {
-			// If sendMessage fails, drop the inbound and nack.
-			inboundQueue.delete(env.msg_id);
 			nack(socket, env.msg_id, "internal error");
 			return;
 		}
 
-		// 4. Ack + audit log
 		ackOk(socket, env.msg_id);
 		try {
 			pi.appendEntry("coms-log", {
 				event: "inbound_prompt",
 				msg_id: env.msg_id,
-				sender: env.sender_session,
+				sender: env.sender_name,
 				hops: env.hops,
 			});
 		} catch {
 			// best-effort
 		}
-	}
-
-	function handleResponse(socket: net.Socket, env: ResponseEnvelope): void {
-		const pending = pendingReplies.get(env.msg_id);
-		if (pending) {
-			if (pending.timer) {
-				try { clearTimeout(pending.timer); } catch { /* ignore */ }
-				pending.timer = null;
-			}
-			pending.result = { response: env.response, error: env.error ?? null };
-			try {
-				pending.resolve(pending.result);
-			} catch {
-				// ignore
-			}
-			// Note: do NOT delete the entry here — coms_get poll may still want it.
-		} else {
-			try {
-				pi.appendEntry("coms-log", { event: "orphan_response", msg_id: env.msg_id });
-			} catch {
-				// best-effort
-			}
-		}
-		ackOk(socket, env.msg_id);
 	}
 
 	function handlePing(socket: net.Socket, env: PingEnvelope): void {
@@ -712,7 +649,6 @@ export default function (pi: ExtensionAPI) {
 			model: ctx?.model?.id ?? ident?.model ?? "unknown",
 			color: ident?.color ?? "#36F9F6",
 			context_used_pct: pct,
-			queue_depth: inboundQueue.size,
 		};
 		const pong: Pong = { type: "pong", msg_id: env.msg_id, agent_card: card };
 		try {
@@ -766,8 +702,6 @@ export default function (pi: ExtensionAPI) {
 			try {
 				if (parsed.type === "prompt") {
 					handlePrompt(socket, parsed as PromptEnvelope);
-				} else if (parsed.type === "response") {
-					handleResponse(socket, parsed as ResponseEnvelope);
 				} else if (parsed.type === "ping") {
 					handlePing(socket, parsed as PingEnvelope);
 				} else {
@@ -879,6 +813,9 @@ export default function (pi: ExtensionAPI) {
 		};
 		includeExplicit = false;
 		displayProject = project;
+		// Expose identity so co-loaded extensions (subagent-widget etc.) can read it.
+		process.env.PI_COMS_PROJECT = project;
+		process.env.PI_COMS_NAME = name;
 
 		// 5. Audit log: boot.
 		try {
@@ -922,7 +859,6 @@ export default function (pi: ExtensionAPI) {
 					explicit: identity.explicit,
 					version: 1,
 					context_used_pct: Math.round(ctx?.getContextUsage()?.percent ?? 0),
-					queue_depth: inboundQueue.size,
 					heartbeat_at: nowIso(),
 				};
 				// Unconditional atomic write: handles BOTH the live-status refresh
@@ -1280,14 +1216,13 @@ export default function (pi: ExtensionAPI) {
 		name: "coms_send",
 		label: "Coms Send",
 		description:
-			"Send a prompt to a peer agent. Returns synchronously with a msg_id once the receiver acks. " +
-			"Use coms_get (non-blocking) or coms_await (blocking) with the msg_id to retrieve the response. " +
-			"Throws if the receiver is unreachable or rejects the envelope.",
+			"Send a message to a peer agent. Fire-and-forget: returns once the receiver acks delivery. " +
+			"The receiver is steered immediately and decides whether to reply via their own coms_send. " +
+			"Throws if the receiver is unreachable.",
 		parameters: Type.Object({
 			target: Type.String({ description: "Peer name (preferred, scoped to your project) or session_id (global)." }),
-			prompt: Type.String({ description: "The prompt to send." }),
-			conversation_id: Type.Optional(Type.String()),
-			response_schema: Type.Optional(Type.Any({ description: "Optional JSON Schema describing the expected response shape." })),
+			prompt: Type.String({ description: "The message to send." }),
+			conversation_id: Type.Optional(Type.String({ description: "Optional thread id to help the receiver correlate this message to a prior exchange." })),
 		}),
 		async execute(_callId, params) {
 			if (!identity) {
@@ -1313,50 +1248,15 @@ export default function (pi: ExtensionAPI) {
 				timestamp: nowIso(),
 				prompt: params.prompt,
 				conversation_id: params.conversation_id ?? null,
-				response_schema: (params.response_schema as object | undefined) ?? null,
 			};
 
-			// Send the envelope synchronously and wait for the receiver's ack.
 			await sendEnvelope(target.endpoint, env);
-
-			// Register a pending entry whose promise the receiver-side handleResponse
-			// (or the timeout below) will settle.
-			let resolveFn!: (v: { response?: any; error?: string | null }) => void;
-			let rejectFn!: (e: Error) => void;
-			const promise = new Promise<{ response?: any; error?: string | null }>((res, rej) => {
-				resolveFn = res;
-				rejectFn = rej;
-			});
-			const entry: PendingReply = {
-				resolve: resolveFn,
-				reject: rejectFn,
-				timer: null,
-				promise,
-				target_name: target.name,
-				created_at: nowIso(),
-			};
-			entry.timer = setTimeout(() => {
-				if (entry.result) return;
-				entry.result = { error: "timeout" };
-				try { entry.resolve(entry.result); } catch { /* ignore */ }
-			}, TIMEOUT_MS);
-			// Don't keep the event loop alive solely for this timer.
-			try { (entry.timer as any).unref?.(); } catch { /* ignore */ }
-			pendingReplies.set(msg_id, entry);
-
 			try {
-				pi.appendEntry("coms-log", {
-					event: "outbound_prompt",
-					msg_id,
-					target: target.name,
-					hops,
-				});
-			} catch {
-				// best-effort
-			}
+				pi.appendEntry("coms-log", { event: "outbound_prompt", msg_id, target: target.name, hops });
+			} catch { /* best-effort */ }
 
 			return {
-				content: [{ type: "text" as const, text: `coms_send → ${target.name}\nmsg_id ${msg_id}\nhops ${hops}` }],
+				content: [{ type: "text" as const, text: `coms_send → ${target.name}` }],
 				details: { msg_id, target: target.name, target_session: target.session_id, hops },
 			};
 		},
@@ -1388,215 +1288,26 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
-		name: "coms_get",
-		label: "Coms Get",
-		description:
-			"Non-blocking poll of a pending coms_send reply. Returns status pending|complete|error and (when complete) the response.",
-		parameters: Type.Object({
-			msg_id: Type.String({ description: "msg_id returned by coms_send." }),
-		}),
-		async execute(_callId, params) {
-			const entry = pendingReplies.get(params.msg_id);
-			if (!entry) {
-				return {
-					content: [{ type: "text" as const, text: `coms_get: unknown msg_id ${params.msg_id}` }],
-					details: { status: "error", error: "unknown msg_id" },
-				};
-			}
-			if (entry.result) {
-				const r = entry.result;
-				const text = r.error
-					? `coms_get: error — ${r.error}`
-					: `coms_get: complete\n${typeof r.response === "string" ? r.response : JSON.stringify(r.response, null, 2)}`;
-				return {
-					content: [{ type: "text" as const, text }],
-					details: { status: "complete", response: r.response, error: r.error ?? null },
-				};
-			}
-			return {
-				content: [{ type: "text" as const, text: `coms_get: pending` }],
-				details: { status: "pending" },
-			};
-		},
-		renderCall(args, theme) {
-			const id = (args as any).msg_id ?? "?";
-			return new Text(
-				theme.fg("toolTitle", theme.bold("coms_get ")) + theme.fg("warning", id),
-				0, 0,
-			);
-		},
-		renderResult(result, _options, theme) {
-			const d = result.details as any;
-			const status = d?.status ?? "?";
-			const color = status === "complete" ? "success" : status === "pending" ? "warning" : "error";
-			return new Text(theme.fg(color, status), 0, 0);
-		},
-	});
 
-	pi.registerTool({
-		name: "coms_await",
-		label: "Coms Await",
-		description:
-			"Block until a pending coms_send reply lands or the timeout fires. Default timeout 30 minutes (PI_COMS_TIMEOUT_MS).",
-		parameters: Type.Object({
-			msg_id: Type.String({ description: "msg_id returned by coms_send." }),
-			timeout_ms: Type.Optional(Type.Number({ description: "Override the default timeout (ms)." })),
-		}),
-		async execute(_callId, params) {
-			const entry = pendingReplies.get(params.msg_id);
-			if (!entry) {
-				return {
-					content: [{ type: "text" as const, text: `coms_await: unknown msg_id ${params.msg_id}` }],
-					details: { error: "unknown msg_id" },
-				};
-			}
-			const timeoutMs = typeof params.timeout_ms === "number" && params.timeout_ms > 0
-				? params.timeout_ms
-				: TIMEOUT_MS;
-
-			const timed = new Promise<{ error: string }>((resolve) => {
-				const t = setTimeout(() => resolve({ error: "timeout" }), timeoutMs);
-				try { (t as any).unref?.(); } catch { /* ignore */ }
-			});
-
-			const winner = await Promise.race([entry.promise, timed]);
-			if ((winner as any).error) {
-				return {
-					content: [{ type: "text" as const, text: `coms_await: error — ${(winner as any).error}` }],
-					details: { error: (winner as any).error },
-				};
-			}
-			const resp = (winner as any).response;
-			return {
-				content: [{ type: "text" as const, text: typeof resp === "string" ? resp : JSON.stringify(resp, null, 2) }],
-				details: { response: resp },
-			};
-		},
-		renderCall(args, theme) {
-			const id = (args as any).msg_id ?? "?";
-			return new Text(
-				theme.fg("toolTitle", theme.bold("coms_await ")) + theme.fg("warning", id),
-				0, 0,
-			);
-		},
-		renderResult(result, _options, theme) {
-			const d = result.details as any;
-			if (d?.error) return new Text(theme.fg("error", `✗ ${d.error}`), 0, 0);
-			return new Text(theme.fg("success", "✓ response received"), 0, 0);
-		},
-	});
-
-	// ━━ agent_start: arm currentInbound for the turn this run executes ━━━
-	// A turn inherits hop count from the inbound that initiated it. We arm it here
-	// (not at queue time) so it tracks the specific turn actually running, and so
-	// proactive non-coms turns correctly originate fresh traffic (hops = 0).
+	// ━━ agent_start: arm currentInbound for hop-count inheritance ━━━━━━━━━━━━━━
+	// Reads hops directly from the coms-inbound message details.
+	// Proactive (non-coms) turns set currentInbound = null so outbound
+	// sends correctly originate at hops = 0.
 
 	pi.on("agent_start", async (_event, ctx) => {
 		if (!identity) return;
 		const initiator = findTurnInitiator(ctx.sessionManager.getBranch());
 		if (initiator?.type === "custom_message" && initiator.customType === "coms-inbound") {
-			const msgId: string | undefined = initiator.details?.msg_id;
-			const inbound = msgId ? inboundQueue.get(msgId) : undefined;
-			currentInbound = inbound && !inbound.fulfilled ? inbound : null;
+			currentInbound = {
+				msg_id: initiator.details?.msg_id ?? "",
+				hops: initiator.details?.hops ?? 0,
+			};
 		} else {
 			currentInbound = null;
 		}
 	});
 
-	// ━━ agent_end: capture turn output and dispatch response back ━━━━━━━━
-	// Only replies when the just-completed turn was actually initiated by an
-	// inbound coms message. A turn triggered by anything else (the agent's own
-	// proactive investigation, a user prompt) never auto-replies, even if an
-	// unrelated inbound is sitting in the queue.
-
-	pi.on("agent_end", async (_event, ctx) => {
-		if (!identity) return;
-
-		const branch = ctx.sessionManager.getBranch();
-		const initiator = findTurnInitiator(branch);
-		if (initiator?.type !== "custom_message" || initiator.customType !== "coms-inbound") {
-			return; // this turn wasn't triggered by a coms message
-		}
-
-		const msgId: string | undefined = initiator.details?.msg_id;
-		if (!msgId) return;
-		const inbound = inboundQueue.get(msgId);
-		if (!inbound || inbound.fulfilled) return;
-
-		// Capture the assistant text produced *after* the initiating message —
-		// i.e. this turn's output, not some earlier turn's leftover text.
-		let lastAssistantText = "";
-		let seenInitiator = false;
-		for (const entry of branch) {
-			if (!seenInitiator) {
-				if (entry.id === initiator.id) seenInitiator = true;
-				continue;
-			}
-			if (entry.type === "message" && entry.message.role === "assistant") {
-				const m = entry.message as any;
-				if (typeof m.content === "string") {
-					lastAssistantText = m.content;
-				} else if (Array.isArray(m.content)) {
-					lastAssistantText = m.content
-						.filter((b: any) => b && b.type === "text")
-						.map((b: any) => b.text)
-						.join("\n");
-				}
-			}
-		}
-
-		let payload: any = lastAssistantText;
-		let error: string | null = null;
-		if (inbound.response_schema && typeof inbound.response_schema === "object") {
-			try {
-				payload = JSON.parse(lastAssistantText);
-			} catch {
-				error = "response not valid JSON";
-				payload = null;
-			}
-		}
-
-		const respEnv: ResponseEnvelope = {
-			type: "response",
-			msg_id: inbound.msg_id,
-			sender_session: identity.session_id,
-			sender_endpoint: identity.endpoint,
-			hops: 0,
-			timestamp: nowIso(),
-			response: payload,
-			error,
-		};
-
-		try {
-			await sendEnvelope(inbound.sender_endpoint, respEnv);
-			try {
-				pi.appendEntry("coms-log", {
-					event: "outbound_response",
-					msg_id: inbound.msg_id,
-					error,
-				});
-			} catch {
-				// best-effort
-			}
-		} catch (e: any) {
-			try {
-				pi.appendEntry("coms-log", {
-					event: "outbound_response_failed",
-					msg_id: inbound.msg_id,
-					reason: e?.message ?? String(e),
-				});
-			} catch {
-				// best-effort
-			}
-		}
-
-		inbound.fulfilled = true;
-		inboundQueue.delete(inbound.msg_id);
-		if (currentInbound && currentInbound.msg_id === inbound.msg_id) {
-			currentInbound = null;
-		}
-	});
+	// (agent_end auto-reply removed — agents decide whether to reply via coms_send)
 
 	// ━━ /coms slash command ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 	pi.registerCommand("coms", {

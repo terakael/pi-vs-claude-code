@@ -1,45 +1,76 @@
 /**
- * Subagent Widget — /sub, /subclear, /subrm, /subcont commands with stacking live widgets
+ * Subagent Widget — tmux-based subagents with a navigator UI
  *
- * Each /sub spawns a background Pi subagent with its own persistent session,
- * enabling conversation continuations via /subcont.
+ * Each subagent is a full Pi TUI running in a detached tmux session.
+ * Jump into any of them live from the navigator.
  *
- * Usage: pi -e extensions/subagent-widget.ts
+ * Usage: pi -e extensions/subagent-widget.ts   (must be inside tmux)
  * Then:
- *   /sub list files and summarize          — spawn a new subagent
- *   /subcont 1 now write tests for it      — continue subagent #1's conversation
- *   /subrm 2                               — remove subagent #2 widget
- *   /subclear                              — clear all subagent widgets
+ *   /sub <task>   — spawn a new subagent
+ *   /sub          — open navigator to pick and enter a running subagent
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { DynamicBorder } from "@mariozechner/pi-coding-agent";
-import { Container, Text } from "@mariozechner/pi-tui";
+import { Container, type SelectItem, SelectList, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-const { spawn } = require("child_process") as any;
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { applyExtensionDefaults } from "./themeMap.ts";
 
+const { execFile } = require("child_process") as typeof import("child_process");
+
+// ── Tmux helpers ──────────────────────────────────────────────────────────────
+
+function tmux(...args: string[]): Promise<string> {
+	return new Promise((resolve, reject) => {
+		execFile("tmux", args, (err, stdout) => {
+			if (err) reject(err);
+			else resolve(stdout.trim());
+		});
+	});
+}
+
+function currentTmuxSession(): Promise<string> {
+	return tmux("display-message", "-p", "#S");
+}
+
+// Wait for the subagent's coms registry entry to appear — a reliable signal
+// that Pi has fully initialised (coms session_start completed and the socket
+// is bound). Much more deterministic than polling pane content.
+async function waitForComsRegistry(comsName: string, project: string, timeoutMs = 10_000): Promise<boolean> {
+	const comsDir = process.env.PI_COMS_DIR || path.join(os.homedir(), ".pi", "coms");
+	const registryFile = path.join(comsDir, "projects", project, "agents", `${comsName}.json`);
+	const start = Date.now();
+	while (Date.now() - start < timeoutMs) {
+		await new Promise<void>(r => setTimeout(r, 150));
+		if (fs.existsSync(registryFile)) return true;
+	}
+	return false;
+}
+
+function shellQuote(s: string): string {
+	return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+// ── State ─────────────────────────────────────────────────────────────────────
+
 interface SubState {
 	id: number;
-	status: "running" | "done" | "error";
 	task: string;
-	textChunks: string[];
-	toolCount: number;
-	elapsed: number;
-	sessionFile: string;   // persistent JSONL session path — used by /subcont to resume
-	turnCount: number;     // increments each time /subcont continues this agent
-	proc?: any;            // active ChildProcess ref (for kill on /subrm)
+	tmuxSession: string;   // shared subs session, e.g. "main-subs"
+	tmuxWindow: string;    // per-subagent window name = comsName
+	comsName: string;      // coms identity, e.g. "agent-X7K2M9-sub-1"
+	sessionFile: string;
+	startedAt: number;
 }
+
+// ── Extension ─────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
 	const agents: Map<number, SubState> = new Map();
 	let nextId = 1;
-	let widgetCtx: any;
-
-	// ── Session file helpers ──────────────────────────────────────────────────
 
 	function makeSessionFile(id: number): string {
 		const dir = path.join(os.homedir(), ".pi", "agent", "sessions", "subagents");
@@ -47,420 +78,174 @@ export default function (pi: ExtensionAPI) {
 		return path.join(dir, `subagent-${id}-${Date.now()}.jsonl`);
 	}
 
-	// ── Widget rendering ──────────────────────────────────────────────────────
-
-	function updateWidgets() {
-		if (!widgetCtx) return;
-
-		for (const [id, state] of Array.from(agents.entries())) {
-			const key = `sub-${id}`;
-			widgetCtx.ui.setWidget(key, (_tui: any, theme: any) => {
-				const container = new Container();
-				const borderFn = (s: string) => theme.fg("dim", s);
-
-				container.addChild(new Text("", 0, 0)); // top margin
-				container.addChild(new DynamicBorder(borderFn));
-				const content = new Text("", 1, 0);
-				container.addChild(content);
-				container.addChild(new DynamicBorder(borderFn));
-
-				return {
-					render(width: number): string[] {
-						const lines: string[] = [];
-						const statusColor = state.status === "running" ? "accent"
-							: state.status === "done" ? "success" : "error";
-						const statusIcon = state.status === "running" ? "●"
-							: state.status === "done" ? "✓" : "✗";
-
-						const taskPreview = state.task.length > 40
-							? state.task.slice(0, 37) + "..."
-							: state.task;
-
-						const turnLabel = state.turnCount > 1
-							? theme.fg("dim", ` · Turn ${state.turnCount}`)
-							: "";
-
-						lines.push(
-							theme.fg(statusColor, `${statusIcon} Subagent #${state.id}`) +
-							turnLabel +
-							theme.fg("dim", `  ${taskPreview}`) +
-							theme.fg("dim", `  (${Math.round(state.elapsed / 1000)}s)`) +
-							theme.fg("dim", ` | Tools: ${state.toolCount}`)
-						);
-
-						const fullText = state.textChunks.join("");
-						const lastLine = fullText.split("\n").filter((l: string) => l.trim()).pop() || "";
-						if (lastLine) {
-							const trimmed = lastLine.length > width - 10
-								? lastLine.slice(0, width - 13) + "..."
-								: lastLine;
-							lines.push(theme.fg("muted", `  ${trimmed}`));
-						}
-
-						content.setText(lines.join("\n"));
-						return container.render(width);
-					},
-					invalidate() {
-						container.invalidate();
-					},
-				};
-			});
+	async function isAlive(state: SubState): Promise<boolean> {
+		try {
+			const windows = await tmux("list-windows", "-t", state.tmuxSession, "-F", "#{window_name}");
+			return windows.split("\n").includes(state.tmuxWindow);
+		} catch {
+			return false;
 		}
 	}
 
-	// ── Streaming helpers ─────────────────────────────────────────────────────
+	async function spawnSubagent(task: string, ctx: any): Promise<SubState> {
+		const id = nextId++;
+		const sessionFile = makeSessionFile(id);
+		const comsName = `${process.env.PI_COMS_NAME ?? "agent"}-sub-${id}`;
+		const comsProject = process.env.PI_COMS_PROJECT ?? "default";
+		const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 
-	function processLine(state: SubState, line: string) {
-		if (!line.trim()) return;
+		const extDir = path.dirname(new URL(import.meta.url).pathname);
+		const comsExt = path.join(extDir, "coms.ts");
+		const widgetExt = path.join(extDir, "subagent-widget.ts");
+
+		const piCmd = [
+			"pi",
+			"-e", shellQuote(comsExt),
+			"-e", shellQuote(widgetExt),
+			"--cname", shellQuote(comsName),
+			"--project", shellQuote(comsProject),
+			"--session", shellQuote(sessionFile),
+			...(model ? ["--model", shellQuote(model)] : []),
+		].join(" ");
+
+		const parentSession = await currentTmuxSession();
+		const subsSession = `${process.env.PI_COMS_NAME ?? parentSession}-subs`;
+		const tmuxWindow = comsName;
+		const envArgs = ["-e", `PI_PARENT_SESSION=${parentSession}`, "-e", `PI_COMS_PROJECT=${comsProject}`];
+
+		// Try to create the shared session; if it already exists (including the
+		// race where a parallel spawn beat us to it), add a window instead.
 		try {
-			const event = JSON.parse(line);
-			const type = event.type;
+			await tmux("new-session", "-d", "-s", subsSession, "-n", tmuxWindow, ...envArgs, piCmd);
+		} catch {
+			await tmux("new-window", "-t", subsSession, "-n", tmuxWindow, ...envArgs, piCmd);
+		}
 
-			if (type === "message_update") {
-				const delta = event.assistantMessageEvent;
-				if (delta?.type === "text_delta") {
-					state.textChunks.push(delta.delta || "");
-					updateWidgets();
-				}
-			} else if (type === "tool_execution_start") {
-				state.toolCount++;
-				updateWidgets();
+		await waitForComsRegistry(comsName, comsProject);
+		await tmux("send-keys", "-t", `${subsSession}:${tmuxWindow}`, task, "Enter");
+
+		const state: SubState = { id, task, tmuxSession: subsSession, tmuxWindow, comsName, sessionFile, startedAt: Date.now() };
+		agents.set(id, state);
+		return state;
+	}
+
+	// ── Navigator UI ──────────────────────────────────────────────────────────
+
+	async function openNavigator(ctx: any): Promise<void> {
+		// Prune dead sessions
+		for (const state of Array.from(agents.values())) {
+			if (!(await isAlive(state))) agents.delete(state.id);
+		}
+
+		if (agents.size === 0) {
+			ctx.ui.notify("No active subagents. Use /sub <task> to start one.", "info");
+			return;
+		}
+
+		const items: SelectItem[] = Array.from(agents.values()).map(s => ({
+			value: String(s.id),
+			label: s.task.length > 52 ? s.task.slice(0, 49) + "…" : s.task,
+			description: `#${s.id}  ·  ${s.comsName}  ·  ${Math.round((Date.now() - s.startedAt) / 1000)}s  ·  ${s.tmuxSession}`,
+		}));
+
+		const chosen = await ctx.ui.custom<string | null>(
+			(tui, theme, _kb, done) => {
+				const container = new Container();
+
+				container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+				container.addChild(new Text(theme.fg("accent", " Subagents"), 1, 0));
+
+				const list = new SelectList(items, Math.min(items.length + 2, 12), {
+					selectedPrefix: (t: string) => theme.fg("accent", t),
+					selectedText:   (t: string) => theme.fg("accent", t),
+					description:    (t: string) => theme.fg("muted", t),
+					scrollInfo:     (t: string) => theme.fg("dim", t),
+					noMatch:        (t: string) => theme.fg("warning", t),
+				});
+				list.onSelect = (item) => done(item.value);
+				list.onCancel = () => done(null);
+				container.addChild(list);
+
+				container.addChild(new Text(theme.fg("dim", " ↑↓ navigate  ·  enter open  ·  esc cancel"), 1, 0));
+				container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+
+				return {
+					render:      (w: number) => container.render(w),
+					invalidate:  ()          => container.invalidate(),
+					handleInput: (data: string) => { list.handleInput(data); tui.requestRender(); },
+				};
+			},
+			{ overlay: true },
+		);
+
+		if (chosen !== null) {
+			const state = agents.get(parseInt(chosen));
+			if (state) {
+				// Switch the current terminal client into the subagent's tmux session.
+				// Use ctrl+b L (last session) or ctrl+b s (session picker) to return.
+				await tmux("switch-client", "-t", `${state.tmuxSession}:${state.tmuxWindow}`);
 			}
-		} catch {}
+		}
 	}
 
-	function spawnAgent(
-		state: SubState,
-		prompt: string,
-		ctx: any,
-	): Promise<void> {
-		const model = ctx.model
-			? `${ctx.model.provider}/${ctx.model.id}`
-			: "openrouter/google/gemini-3-flash-preview";
+	// ── /sub ──────────────────────────────────────────────────────────────────
 
-		return new Promise<void>((resolve) => {
-			const proc = spawn("pi", [
-				"--mode", "json",
-				"-p",
-				"--session", state.sessionFile,   // persistent session for /subcont resumption
-				"--no-extensions",
-				"--model", model,
-				"--tools", "read,bash,grep,find,ls",
-				"--thinking", "off",
-				prompt,
-			], {
-				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env },
-			});
+	pi.registerCommand("sub", {
+		description: "Spawn a subagent (/sub <task>) or navigate running ones (/sub)",
+		handler: async (args, ctx) => {
+			if (!process.env.TMUX) {
+				ctx.ui.notify("Not in a tmux session — start pi inside tmux to use /sub.", "warning");
+				return;
+			}
 
-			state.proc = proc;
+			const task = args?.trim();
 
-			const startTime = Date.now();
-			const timer = setInterval(() => {
-				state.elapsed = Date.now() - startTime;
-				updateWidgets();
-			}, 1000);
+			if (task) {
+				const state = await spawnSubagent(task, ctx);
+				ctx.ui.notify(`Subagent #${state.id}  ·  ${state.tmuxSession}:${state.tmuxWindow}  ·  coms: ${state.comsName}`, "success");
+				return;
+			}
 
-			let buffer = "";
+			await openNavigator(ctx);
+		},
+	});
 
-			proc.stdout!.setEncoding("utf-8");
-			proc.stdout!.on("data", (chunk: string) => {
-				buffer += chunk;
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(state, line);
-			});
-
-			proc.stderr!.setEncoding("utf-8");
-			proc.stderr!.on("data", (chunk: string) => {
-				if (chunk.trim()) {
-					state.textChunks.push(chunk);
-					updateWidgets();
-				}
-			});
-
-			proc.on("close", (code) => {
-				if (buffer.trim()) processLine(state, buffer);
-				clearInterval(timer);
-				state.elapsed = Date.now() - startTime;
-				state.status = code === 0 ? "done" : "error";
-				state.proc = undefined;
-				updateWidgets();
-
-				const result = state.textChunks.join("");
-				ctx.ui.notify(
-					`Subagent #${state.id} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
-					state.status === "done" ? "success" : "error"
-				);
-
-				pi.sendMessage({
-					customType: "subagent-result",
-					content: `Subagent #${state.id}${state.turnCount > 1 ? ` (Turn ${state.turnCount})` : ""} finished "${prompt}" in ${Math.round(state.elapsed / 1000)}s.\n\nResult:\n${result.slice(0, 8000)}${result.length > 8000 ? "\n\n... [truncated]" : ""}`,
-					display: true,
-				}, { deliverAs: "followUp", triggerTurn: true });
-
-				resolve();
-			});
-
-			proc.on("error", (err) => {
-				clearInterval(timer);
-				state.status = "error";
-				state.proc = undefined;
-				state.textChunks.push(`Error: ${err.message}`);
-				updateWidgets();
-				resolve();
-			});
-		});
-	}
-
-		// ── Tools for the Main Agent ──────────────────────────────────────────────
+	// ── LLM tools ─────────────────────────────────────────────────────────────
 
 	pi.registerTool({
 		name: "subagent_create",
-		description: "Spawn a background subagent to perform a task. Returns the subagent ID immediately while it runs in the background. Results will be delivered as a follow-up message when finished.",
+		description: "Spawn a background subagent in its own tmux session running a full Pi TUI. Returns the subagent ID and tmux session name.",
 		parameters: Type.Object({
 			task: Type.String({ description: "The complete task description for the subagent to perform" }),
 		}),
-		execute: async (callId, args, _signal, _onUpdate, ctx) => {
-			widgetCtx = ctx;
-			const id = nextId++;
-			const state: SubState = {
-				id,
-				status: "running",
-				task: args.task,
-				textChunks: [],
-				toolCount: 0,
-				elapsed: 0,
-				sessionFile: makeSessionFile(id),
-				turnCount: 1,
-			};
-			agents.set(id, state);
-			updateWidgets();
-
-			// Fire-and-forget
-			spawnAgent(state, args.task, ctx);
-
+		execute: async (_callId, args, _signal, _onUpdate, ctx) => {
+			if (!process.env.TMUX) {
+				return { content: [{ type: "text", text: "Error: not in a tmux session. subagent_create requires tmux." }] };
+			}
+			const state = await spawnSubagent(args.task, ctx);
 			return {
-				content: [{ type: "text", text: `Subagent #${id} spawned and running in background.` }],
-			};
-		},
-	});
-
-	pi.registerTool({
-		name: "subagent_continue",
-		description: "Continue an existing subagent's conversation. Use this to give further instructions to a finished subagent. Returns immediately while it runs in the background.",
-		parameters: Type.Object({
-			id: Type.Number({ description: "The ID of the subagent to continue" }),
-			prompt: Type.String({ description: "The follow-up prompt or new instructions" }),
-		}),
-		execute: async (callId, args, _signal, _onUpdate, ctx) => {
-			widgetCtx = ctx;
-			const state = agents.get(args.id);
-			if (!state) {
-				return { content: [{ type: "text", text: `Error: No subagent #${args.id} found.` }] };
-			}
-			if (state.status === "running") {
-				return { content: [{ type: "text", text: `Error: Subagent #${args.id} is still running.` }] };
-			}
-
-			state.status = "running";
-			state.task = args.prompt;
-			state.textChunks = [];
-			state.elapsed = 0;
-			state.turnCount++;
-			updateWidgets();
-
-			ctx.ui.notify(`Continuing Subagent #${args.id} (Turn ${state.turnCount})…`, "info");
-			spawnAgent(state, args.prompt, ctx);
-
-			return {
-				content: [{ type: "text", text: `Subagent #${args.id} continuing conversation in background.` }],
-			};
-		},
-	});
-
-	pi.registerTool({
-		name: "subagent_remove",
-		description: "Remove a specific subagent. Kills it if it's currently running.",
-		parameters: Type.Object({
-			id: Type.Number({ description: "The ID of the subagent to remove" }),
-		}),
-		execute: async (callId, args, _signal, _onUpdate, ctx) => {
-			widgetCtx = ctx;
-			const state = agents.get(args.id);
-			if (!state) {
-				return { content: [{ type: "text", text: `Error: No subagent #${args.id} found.` }] };
-			}
-
-			if (state.proc && state.status === "running") {
-				state.proc.kill("SIGTERM");
-			}
-			ctx.ui.setWidget(`sub-${args.id}`, undefined);
-			agents.delete(args.id);
-
-			return {
-				content: [{ type: "text", text: `Subagent #${args.id} removed successfully.` }],
+				content: [{ type: "text", text: `Subagent #${state.id} spawned  ·  tmux: "${state.tmuxSession}"  ·  coms: "${state.comsName}"  ·  use coms_send target="${state.comsName}" to send it messages` }],
 			};
 		},
 	});
 
 	pi.registerTool({
 		name: "subagent_list",
-		description: "List all active and finished subagents, showing their IDs, tasks, and status.",
+		description: "List all active subagents with their IDs and tmux session names.",
 		parameters: Type.Object({}),
 		execute: async () => {
-			if (agents.size === 0) {
+			const alive: string[] = [];
+			for (const s of agents.values()) {
+				if (await isAlive(s)) {
+					alive.push(`#${s.id}  ${s.tmuxSession}  "${s.task}"`);
+				} else {
+					agents.delete(s.id);
+				}
+			}
+			if (alive.length === 0) {
 				return { content: [{ type: "text", text: "No active subagents." }] };
 			}
-
-			const list = Array.from(agents.values()).map(s => 
-				`#${s.id} [${s.status.toUpperCase()}] (Turn ${s.turnCount}) - ${s.task}`
-			).join("\n");
-
-			return {
-				content: [{ type: "text", text: `Subagents:\n${list}` }],
-			};
-		},
-	});
-
-
-
-	// ── /sub <task> ───────────────────────────────────────────────────────────
-
-	pi.registerCommand("sub", {
-		description: "Spawn a subagent with live widget: /sub <task>",
-		handler: async (args, ctx) => {
-			widgetCtx = ctx;
-
-			const task = args?.trim();
-			if (!task) {
-				ctx.ui.notify("Usage: /sub <task>", "error");
-				return;
-			}
-
-			const id = nextId++;
-			const state: SubState = {
-				id,
-				status: "running",
-				task,
-				textChunks: [],
-				toolCount: 0,
-				elapsed: 0,
-				sessionFile: makeSessionFile(id),
-				turnCount: 1,
-			};
-			agents.set(id, state);
-			updateWidgets();
-
-			// Fire-and-forget
-			spawnAgent(state, task, ctx);
-		},
-	});
-
-	// ── /subcont <number> <prompt> ────────────────────────────────────────────
-
-	pi.registerCommand("subcont", {
-		description: "Continue an existing subagent's conversation: /subcont <number> <prompt>",
-		handler: async (args, ctx) => {
-			widgetCtx = ctx;
-
-			const trimmed = args?.trim() ?? "";
-			const spaceIdx = trimmed.indexOf(" ");
-			if (spaceIdx === -1) {
-				ctx.ui.notify("Usage: /subcont <number> <prompt>", "error");
-				return;
-			}
-
-			const num = parseInt(trimmed.slice(0, spaceIdx), 10);
-			const prompt = trimmed.slice(spaceIdx + 1).trim();
-
-			if (isNaN(num) || !prompt) {
-				ctx.ui.notify("Usage: /subcont <number> <prompt>", "error");
-				return;
-			}
-
-			const state = agents.get(num);
-			if (!state) {
-				ctx.ui.notify(`No subagent #${num} found. Use /sub to create one.`, "error");
-				return;
-			}
-
-			if (state.status === "running") {
-				ctx.ui.notify(`Subagent #${num} is still running — wait for it to finish first.`, "warning");
-				return;
-			}
-
-			// Resume: update state for a new turn
-			state.status = "running";
-			state.task = prompt;
-			state.textChunks = [];
-			state.elapsed = 0;
-			state.turnCount++;
-			updateWidgets();
-
-			ctx.ui.notify(`Continuing Subagent #${num} (Turn ${state.turnCount})…`, "info");
-
-			// Fire-and-forget — reuses the same sessionFile for conversation history
-			spawnAgent(state, prompt, ctx);
-		},
-	});
-
-	// ── /subrm <number> ───────────────────────────────────────────────────────
-
-	pi.registerCommand("subrm", {
-		description: "Remove a specific subagent widget: /subrm <number>",
-		handler: async (args, ctx) => {
-			widgetCtx = ctx;
-
-			const num = parseInt(args?.trim() ?? "", 10);
-			if (isNaN(num)) {
-				ctx.ui.notify("Usage: /subrm <number>", "error");
-				return;
-			}
-
-			const state = agents.get(num);
-			if (!state) {
-				ctx.ui.notify(`No subagent #${num} found.`, "error");
-				return;
-			}
-
-			// Kill the process if still running
-			if (state.proc && state.status === "running") {
-				state.proc.kill("SIGTERM");
-				ctx.ui.notify(`Subagent #${num} killed and removed.`, "warning");
-			} else {
-				ctx.ui.notify(`Subagent #${num} removed.`, "info");
-			}
-
-			ctx.ui.setWidget(`sub-${num}`, undefined);
-			agents.delete(num);
-		},
-	});
-
-	// ── /subclear ─────────────────────────────────────────────────────────────
-
-	pi.registerCommand("subclear", {
-		description: "Clear all subagent widgets",
-		handler: async (_args, ctx) => {
-			widgetCtx = ctx;
-
-			let killed = 0;
-			for (const [id, state] of Array.from(agents.entries())) {
-				if (state.proc && state.status === "running") {
-					state.proc.kill("SIGTERM");
-					killed++;
-				}
-				ctx.ui.setWidget(`sub-${id}`, undefined);
-			}
-
-			const total = agents.size;
-			agents.clear();
-			nextId = 1;
-
-			const msg = total === 0
-				? "No subagents to clear."
-				: `Cleared ${total} subagent${total !== 1 ? "s" : ""}${killed > 0 ? ` (${killed} killed)` : ""}.`;
-			ctx.ui.notify(msg, total === 0 ? "info" : "success");
+			return { content: [{ type: "text", text: alive.join("\n") }] };
 		},
 	});
 
@@ -468,14 +253,44 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		applyExtensionDefaults(import.meta.url, ctx);
-		for (const [id, state] of Array.from(agents.entries())) {
-			if (state.proc && state.status === "running") {
-				state.proc.kill("SIGTERM");
-			}
-			ctx.ui.setWidget(`sub-${id}`, undefined);
-		}
 		agents.clear();
 		nextId = 1;
-		widgetCtx = ctx;
+
+		// If we were spawned as a subagent, register a shortcut to jump back
+		// to the parent tmux session and inject a standing system-prompt
+		// instruction to always report results back via coms_send.
+		const parent = process.env.PI_PARENT_SESSION;
+		const parentComsName = process.env.PI_COMS_NAME?.replace(/-sub-\d+$/, "");
+		const isSubagent = parentComsName && parentComsName !== process.env.PI_COMS_NAME;
+		if (parent && process.env.TMUX) {
+			pi.registerShortcut("alt+p", {
+				description: `Go to parent session (${parent})`,
+				handler: async (sctx) => {
+					try {
+						await tmux("switch-client", "-t", parent);
+					} catch {
+						sctx.ui.notify(`Parent session "${parent}" is no longer available.`, "warning");
+					}
+				},
+			});
+		}
+
+		// In the parent session, a keyboard shortcut to open the navigator.
+		if (!parent && process.env.TMUX) {
+			pi.registerShortcut("alt+s", {
+				description: "Open subagent navigator",
+				handler: async (sctx) => { await openNavigator(sctx); },
+			});
+		}
+
+		// Standing instruction: subagents always report back when done.
+		if (isSubagent) {
+			pi.on("before_agent_start", async (event) => {
+				return {
+					systemPrompt: event.systemPrompt +
+						`\n\nYou are a subagent. When you have completed your task, you MUST send your result back to your parent agent using the coms_send tool with target="${parentComsName}". Do not finish without doing this.`,
+				};
+			});
+		}
 	});
 }
