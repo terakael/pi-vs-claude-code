@@ -89,6 +89,7 @@ interface AgentCard {
   color: string;
   context_used_pct: number;
   is_running?: boolean;
+  is_blocked?: boolean;
 }
 
 interface Pong {
@@ -100,6 +101,7 @@ interface Pong {
 interface StatusMessage {
   type: "status";
   is_running: boolean;
+  is_blocked?: boolean;
   closing?: boolean;
 }
 
@@ -752,6 +754,7 @@ export default function (pi: ExtensionAPI) {
   let selectedIndex = -1;
   let widgetVisible = true;
   let agentRunning = false;
+  let agentBlocked = false;
   let spinnerFrame = 0;
   let spinnerTimer: NodeJS.Timeout | null = null;
   let currentTui: any = null;
@@ -835,6 +838,7 @@ export default function (pi: ExtensionAPI) {
       color: ident?.color ?? "#36F9F6",
       context_used_pct: pct,
       is_running: agentRunning,
+      is_blocked: agentBlocked || undefined,
     };
     const pong: Pong = { type: "pong", msg_id: env.msg_id, agent_card: card };
     try {
@@ -863,6 +867,7 @@ export default function (pi: ExtensionAPI) {
     const card = peerCards.get(sid);
     if (card) {
       card.is_running = msg.is_running;
+      card.is_blocked = msg.is_blocked ?? false;
       updateSpinnerTimer();
       currentTui?.requestRender?.();
     }
@@ -909,6 +914,7 @@ export default function (pi: ExtensionAPI) {
       JSON.stringify({
         type: "status",
         is_running,
+        is_blocked: agentBlocked || undefined,
         closing: closing || undefined,
         sender_session: identity.session_id,
       }) + "\n";
@@ -1345,6 +1351,7 @@ export default function (pi: ExtensionAPI) {
     pending: boolean;
     stale: boolean;
     running: boolean;
+    blocked: boolean;
     relationship: "parent" | "child" | "sibling" | "peer";
   }
 
@@ -1370,6 +1377,7 @@ export default function (pi: ExtensionAPI) {
         pending: false,
         stale: (card.staleCount ?? 0) >= 3,
         running: card.is_running ?? false,
+        blocked: card.is_blocked ?? false,
         relationship: identity
           ? agentRelationship(identity.name, card.name)
           : "peer",
@@ -1391,6 +1399,7 @@ export default function (pi: ExtensionAPI) {
         pending: true,
         stale: false,
         running: false,
+        blocked: false,
         relationship: identity
           ? agentRelationship(identity.name, entry.name)
           : "peer",
@@ -1546,11 +1555,13 @@ export default function (pi: ExtensionAPI) {
         continue;
       }
 
-      const swatch = r.running
-        ? hexFg(r.color, SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length]!)
-        : r.pending
-          ? theme.fg("dim", "●")
-          : hexFg(r.color, "●");
+      const swatch = r.blocked
+        ? theme.fg("warning", "⊘")
+        : r.running
+          ? hexFg(r.color, SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length]!)
+          : r.pending
+            ? theme.fg("dim", "●")
+            : hexFg(r.color, "●");
       const namePart = theme.fg("accent", r.name.padEnd(11));
       const modelPart = theme.fg("dim", abbreviateModel(r.model).padEnd(16));
       const pctPart = theme.fg(
@@ -2049,6 +2060,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     await cleanShutdown();
+  });
+  (process as any).on("pi:agent_blocked", (blocked: boolean) => {
+    agentBlocked = blocked;
+    void broadcastStatus(agentRunning);
   });
   process.on("SIGINT", () => {
     void cleanShutdown();
