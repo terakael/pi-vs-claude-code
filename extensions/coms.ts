@@ -29,7 +29,6 @@ import {
 import type { AutocompleteItem } from "@mariozechner/pi-tui";
 import { spawnSync } from "node:child_process";
 import { Type } from "@sinclair/typebox";
-import { applyExtensionDefaults } from "./themeMap.ts";
 import * as net from "node:net";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -799,7 +798,7 @@ export default function (pi: ExtensionAPI) {
       pi.sendMessage(
         {
           customType: "coms-inbound",
-          content: `[coms · from ${env.sender_name} · reply via coms_send target="${env.sender_name}" when done]\n\n${env.prompt}`,
+          content: `[coms · from ${env.sender_name} · reply via coms_send target="${env.sender_name}" if needed]\n\n${env.prompt}`,
           display: true,
           details: {
             msg_id: env.msg_id,
@@ -885,7 +884,11 @@ export default function (pi: ExtensionAPI) {
         sender_session: deadSessionId,
       }) + "\n";
     const sends = entries
-      .filter((e) => e.session_id !== identity!.session_id && e.session_id !== deadSessionId)
+      .filter(
+        (e) =>
+          e.session_id !== identity!.session_id &&
+          e.session_id !== deadSessionId,
+      )
       .map(
         (entry) =>
           new Promise<void>((resolve) => {
@@ -893,7 +896,12 @@ export default function (pi: ExtensionAPI) {
               const sock = net.createConnection(entry.endpoint);
               const done = () => resolve();
               sock.once("connect", () => {
-                try { sock.write(payload); sock.end(); } catch { /* ignore */ }
+                try {
+                  sock.write(payload);
+                  sock.end();
+                } catch {
+                  /* ignore */
+                }
               });
               sock.once("close", done);
               sock.once("error", done);
@@ -906,7 +914,10 @@ export default function (pi: ExtensionAPI) {
     return Promise.all(sends).then(() => undefined);
   }
 
-  function broadcastStatus(is_running: boolean, closing = false): Promise<void> {
+  function broadcastStatus(
+    is_running: boolean,
+    closing = false,
+  ): Promise<void> {
     if (!identity) return Promise.resolve();
     const projectFilter = identity.project ?? "default";
     const entries = readAllRegistryEntries(projectFilter);
@@ -927,7 +938,12 @@ export default function (pi: ExtensionAPI) {
               const sock = net.createConnection(entry.endpoint);
               const done = () => resolve();
               sock.once("connect", () => {
-                try { sock.write(payload); sock.end(); } catch { /* ignore */ }
+                try {
+                  sock.write(payload);
+                  sock.end();
+                } catch {
+                  /* ignore */
+                }
               });
               sock.once("close", done);
               sock.once("error", done);
@@ -1032,7 +1048,6 @@ export default function (pi: ExtensionAPI) {
 
   // ━━ session_start ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   pi.on("session_start", async (_event, ctx) => {
-    applyExtensionDefaults(import.meta.url, ctx);
     currentCtx = ctx;
 
     // 1. Resolve identity from CLI flags > frontmatter > defaults.
@@ -1205,7 +1220,7 @@ export default function (pi: ExtensionAPI) {
             selectedIndex = n;
           },
           navigateToAgent,
-					closeAgent,
+          closeAgent,
           new Map([["h", toggleWidget]]),
           (active) => {
             if (!identity || !currentCtx?.hasUI) return;
@@ -1504,7 +1519,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     try {
-      const r = spawnSync("tmux", ["kill-pane", "-t", pane], { encoding: "utf-8" });
+      const r = spawnSync("tmux", ["kill-pane", "-t", pane], {
+        encoding: "utf-8",
+      });
       if (r.status !== 0) {
         currentCtx?.ui?.notify?.(`coms: couldn't close ${name}`, "error");
         return;
@@ -1534,7 +1551,8 @@ export default function (pi: ExtensionAPI) {
     const effectiveSel = selectedIndex < rows.length ? selectedIndex : -1;
     const out: string[] = [
       truncateToWidth(
-        theme.fg("dim", "coms for ") + hexFg(identity?.color ?? "#36F9F6", identity?.name ?? ""),
+        theme.fg("dim", "coms for ") +
+          hexFg(identity?.color ?? "#36F9F6", identity?.name ?? ""),
         width,
       ),
     ];
@@ -1558,7 +1576,10 @@ export default function (pi: ExtensionAPI) {
       const swatch = r.blocked
         ? theme.fg("warning", "⊘")
         : r.running
-          ? hexFg(r.color, SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length]!)
+          ? hexFg(
+              r.color,
+              SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length]!,
+            )
           : r.pending
             ? theme.fg("dim", "●")
             : hexFg(r.color, "●");
@@ -1718,7 +1739,7 @@ export default function (pi: ExtensionAPI) {
     label: "Coms List",
     description:
       "List peer agents discoverable via coms. Returns names, models, and live context-window usage. " +
-      'Use project="*" to scan all projects. include_explicit=true reveals agents marked --explicit.',
+      'Use project="*" if you must scan all projects. include_explicit=true reveals agents marked --explicit.',
     parameters: Type.Object({
       project: Type.Optional(
         Type.String({
