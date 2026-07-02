@@ -87,7 +87,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	async function spawnSubagent(task: string, ctx: any): Promise<SubState> {
+	async function spawnSubagent(task: string, purposeOverride: string | undefined, ctx: any): Promise<SubState> {
 		const id = nextId++;
 		const sessionFile = makeSessionFile(id);
 		const comsName = `${process.env.PI_COMS_NAME ?? "agent"}-sub-${id}`;
@@ -98,6 +98,8 @@ export default function (pi: ExtensionAPI) {
 		const comsExt = path.join(extDir, "coms.ts");
 		const widgetExt = path.join(extDir, "subagent-widget.ts");
 
+		const purpose = (purposeOverride ?? task).slice(0, 80).replace(/\s+/g, " ").trim();
+
 		const piCmd = [
 			"pi",
 			"-e", shellQuote(comsExt),
@@ -105,6 +107,7 @@ export default function (pi: ExtensionAPI) {
 			"--cname", shellQuote(comsName),
 			"--project", shellQuote(comsProject),
 			"--session", shellQuote(sessionFile),
+			"--purpose", shellQuote(purpose),
 			...(model ? ["--model", shellQuote(model)] : []),
 		].join(" ");
 
@@ -217,12 +220,13 @@ export default function (pi: ExtensionAPI) {
 		description: "Spawn a background subagent in its own tmux session running a full Pi TUI. Returns the subagent ID and tmux session name.",
 		parameters: Type.Object({
 			task: Type.String({ description: "The complete task description for the subagent to perform" }),
+			purpose: Type.Optional(Type.String({ description: "Short label (≤80 chars) shown in the coms pool widget. Defaults to the first 80 chars of task." })),
 		}),
 		execute: async (_callId, args, _signal, _onUpdate, ctx) => {
 			if (!process.env.TMUX) {
 				return { content: [{ type: "text", text: "Error: not in a tmux session. subagent_create requires tmux." }] };
 			}
-			const state = await spawnSubagent(args.task, ctx);
+			const state = await spawnSubagent(args.task, args.purpose, ctx);
 			return {
 				content: [{ type: "text", text: `Subagent #${state.id} spawned  ·  tmux: "${state.tmuxSession}"  ·  coms: "${state.comsName}"  ·  use coms_send target="${state.comsName}" to send it messages` }],
 			};
@@ -262,27 +266,6 @@ export default function (pi: ExtensionAPI) {
 		const parent = process.env.PI_PARENT_SESSION;
 		const parentComsName = process.env.PI_COMS_NAME?.replace(/-sub-\d+$/, "");
 		const isSubagent = parentComsName && parentComsName !== process.env.PI_COMS_NAME;
-		if (parent && process.env.TMUX) {
-			pi.registerShortcut("alt+p", {
-				description: `Go to parent session (${parent})`,
-				handler: async (sctx) => {
-					try {
-						await tmux("switch-client", "-t", parent);
-					} catch {
-						sctx.ui.notify(`Parent session "${parent}" is no longer available.`, "warning");
-					}
-				},
-			});
-		}
-
-		// In the parent session, a keyboard shortcut to open the navigator.
-		if (!parent && process.env.TMUX) {
-			pi.registerShortcut("alt+s", {
-				description: "Open subagent navigator",
-				handler: async (sctx) => { await openNavigator(sctx); },
-			});
-		}
-
 		// Standing instruction: subagents always report back when done.
 		if (isSubagent) {
 			pi.on("before_agent_start", async (event) => {
