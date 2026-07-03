@@ -608,7 +608,7 @@ class ComsNavEditor extends CustomEditor {
     private _tui: any,
     theme: any,
     keybindings: any,
-    private agentName: string,
+    private getAgentName: () => string,
     private getStats: () => { model: string | undefined; contextPct: number | null | undefined },
     private getWorkingState: () => { running: boolean; frame: number; color: string },
     private getRows: () => string[],
@@ -699,7 +699,7 @@ class ComsNavEditor extends CustomEditor {
       const left = running ? `${d} ${hexFg(color, spinChar)} ` : "";
       const { model, contextPct } = this.getStats();
       const pct = contextPct != null ? `${Math.round(contextPct)}%` : "?%";
-      const right = ` 📡 ${this.agentName} ${d} ${model ?? ""} ${d} ${pct} ${d}`;
+      const right = ` 📡 ${this.getAgentName()} ${d} ${model ?? ""} ${d} ${pct} ${d}`;
       const lw = visibleWidth(left);
       const rw = visibleWidth(right);
       const mid = truncateToWidth(lines[last]!, width - lw - rw, "");
@@ -1311,10 +1311,8 @@ export default function (pi: ExtensionAPI) {
 
     // 6. Surface presence in the UI + install the live pool widget.
     try {
-      ctx.ui.setStatus(
-        "coms",
-        `📡 ${name}@${name}${namedProject ? `+${namedProject}` : ""}`,
-      );
+      const extraPools = extraProjects.filter((p) => p !== name);
+      const poolSuffix = extraPools.length > 0 ? ` [${extraPools.join(", ")}]` : "";
       installPoolWidget(ctx);
       ctx.ui.setWorkingVisible(false);
       ctx.ui.setEditorComponent((tui, theme, kb) => {
@@ -1323,7 +1321,10 @@ export default function (pi: ExtensionAPI) {
           tui,
           theme,
           kb,
-          name,
+          () => {
+            const extra = extraProjects.filter((p) => p !== identity?.project);
+            return extra.length > 0 ? `${name} [${extra.join(", ")}]` : name;
+          },
           () => ({ model: ctx.model?.name, contextPct: ctx.getContextUsage()?.percent }),
           () => ({ running: agentRunning, frame: spinnerFrame, color: identity?.color ?? "#36F9F6" }),
           () => buildPoolRows().map((r) => r.name),
@@ -1336,7 +1337,9 @@ export default function (pi: ExtensionAPI) {
           new Map([["h", toggleWidget]]),
           (active) => {
             if (!identity || !currentCtx?.hasUI) return;
-            const base = `📡 ${identity.name}`;
+            const extra = extraProjects.filter((p) => p !== identity!.project);
+            const suffix = extra.length > 0 ? ` [${extra.join(", ")}]` : "";
+            const base = `📡 ${identity.name}${suffix}`;
             try {
               currentCtx.ui.setStatus("coms", active ? `${base} [C-x]` : base);
             } catch {
@@ -1346,10 +1349,7 @@ export default function (pi: ExtensionAPI) {
           (line) => ctx.ui.theme.bg("toolPendingBg", line),
         );
       });
-      ctx.ui.notify(
-        `📡 coms ready · ${name} · pools: ${allProjects().join(", ")}`,
-        "info",
-      );
+      ctx.ui.setStatus("coms", `📡 ${name}${poolSuffix}`);
     } catch {
       // hasUI may be false in some contexts — non-fatal.
     }
@@ -2106,9 +2106,17 @@ export default function (pi: ExtensionAPI) {
   // ━━ /coms slash command ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   pi.registerCommand("coms", {
     description:
-      "Force-refresh the coms pool widget (or filter with --all / --project <name>)",
+      "Force-refresh the coms pool widget (or filter with --all / --project <name> / --pools)",
     handler: async (args, ctx) => {
       const trimmed = (args ?? "").trim();
+      if (trimmed.includes("--pools")) {
+        try {
+          ctx.ui.notify(`coms: pools · ${allProjects().join(", ")}`, "info");
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
       if (trimmed.includes("--all")) {
         includeExplicit = !includeExplicit;
         try {
@@ -2145,6 +2153,9 @@ export default function (pi: ExtensionAPI) {
           }
         }
         try {
+          const extra = extraProjects.filter((p) => p !== identity?.project);
+          const suffix = extra.length > 0 ? ` [${extra.join(", ")}]` : "";
+          ctx.ui.setStatus("coms", `📡 ${identity?.name ?? ""}${suffix}`);
           ctx.ui.notify(
             `coms: joined project ${p} · pools: ${allProjects().join(", ")}`,
             "info",
