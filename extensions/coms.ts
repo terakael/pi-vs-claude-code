@@ -610,6 +610,7 @@ class ComsNavEditor extends CustomEditor {
     keybindings: any,
     private agentName: string,
     private getStats: () => { model: string | undefined; contextPct: number | null | undefined },
+    private getWorkingState: () => { running: boolean; frame: number; color: string },
     private getRows: () => string[],
     private getSelected: () => number,
     private setSelected: (n: number) => void,
@@ -693,10 +694,12 @@ class ComsNavEditor extends CustomEditor {
       const dashIdx = borderLine.indexOf("─");
       const borderStyle = dashIdx > 0 ? borderLine.slice(0, dashIdx) : "";
       const d = borderStyle ? `${borderStyle}─\x1b[0m` : "─";
-      const left = `${d} 📡 ${this.agentName} `;
+      const { running, frame, color } = this.getWorkingState();
+      const spinChar = SPINNER_FRAMES[frame % SPINNER_FRAMES.length]!;
+      const left = running ? `${d} ${hexFg(color, spinChar)} ` : "";
       const { model, contextPct } = this.getStats();
       const pct = contextPct != null ? `${Math.round(contextPct)}%` : "?%";
-      const right = ` ${model ?? ""} ${d} ${pct} ${d}`;
+      const right = ` 📡 ${this.agentName} ${d} ${model ?? ""} ${d} ${pct} ${d}`;
       const lw = visibleWidth(left);
       const rw = visibleWidth(right);
       const mid = truncateToWidth(lines[last]!, width - lw - rw, "");
@@ -1053,7 +1056,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function updateSpinnerTimer(): void {
-    const anyRunning = [...peerCards.values()].some((c) => c.is_running);
+    const anyRunning = agentRunning || [...peerCards.values()].some((c) => c.is_running);
     if (anyRunning && !spinnerTimer) {
       spinnerTimer = setInterval(() => {
         spinnerFrame = (spinnerFrame + 1) % SPINNER_FRAMES.length;
@@ -1313,6 +1316,7 @@ export default function (pi: ExtensionAPI) {
         `📡 ${name}@${name}${namedProject ? `+${namedProject}` : ""}`,
       );
       installPoolWidget(ctx);
+      ctx.ui.setWorkingVisible(false);
       ctx.ui.setEditorComponent((tui, theme, kb) => {
         currentTui = tui;
         return new ComsNavEditor(
@@ -1321,6 +1325,7 @@ export default function (pi: ExtensionAPI) {
           kb,
           name,
           () => ({ model: ctx.model?.name, contextPct: ctx.getContextUsage()?.percent }),
+          () => ({ running: agentRunning, frame: spinnerFrame, color: identity?.color ?? "#36F9F6" }),
           () => buildPoolRows().map((r) => r.name),
           () => selectedIndex,
           (n) => {
@@ -2068,6 +2073,7 @@ export default function (pi: ExtensionAPI) {
     if (!identity) return;
     agentRunning = true;
     broadcastStatus(true);
+    updateSpinnerTimer();
     selectedIndex = -1;
     const initiator = findTurnInitiator(ctx.sessionManager.getBranch());
     if (
@@ -2085,10 +2091,16 @@ export default function (pi: ExtensionAPI) {
 
   // (agent_end auto-reply removed — agents decide whether to reply via coms_send)
 
+  pi.on("before_agent_start", async (_event, ctx) => {
+    if (!identity || !ctx.hasUI) return;
+    try { ctx.ui.setWorkingVisible(false); } catch { /* ignore */ }
+  });
+
   pi.on("agent_end", async () => {
     if (!identity) return;
     agentRunning = false;
     broadcastStatus(false);
+    updateSpinnerTimer();
   });
 
   // ━━ /coms slash command ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2219,6 +2231,11 @@ export default function (pi: ExtensionAPI) {
       }
       try {
         currentCtx.ui.setEditorComponent(undefined);
+      } catch {
+        /* ignore */
+      }
+      try {
+        currentCtx.ui.setWorkingVisible(true);
       } catch {
         /* ignore */
       }
