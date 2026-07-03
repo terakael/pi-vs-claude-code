@@ -1622,13 +1622,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     const effectiveSel = selectedIndex < rows.length ? selectedIndex : -1;
-    const out: string[] = [
-      truncateToWidth(
-        theme.fg("dim", "coms for ") +
-          hexFg(identity?.color ?? "#36F9F6", identity?.name ?? ""),
-        width,
-      ),
-    ];
+    const out: string[] = [];
 
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i]!;
@@ -1641,8 +1635,8 @@ export default function (pi: ExtensionAPI) {
 
       if (r.stale) {
         const dimRow = `✗ ${relIcon}${r.name.padEnd(11)} ${abbreviateModel(r.model).padEnd(16)}  ${pctLabel.padStart(4)}  —  ${r.purpose || ""}`;
-        const truncated = truncateToWidth(" " + theme.fg("dim", dimRow), width);
-        out.push(isSelected ? theme.bold(theme.bg("selectedBg", truncated)) : truncated);
+        const truncated = truncateToWidth((isSelected ? "❯ " : "  ") + theme.fg("dim", dimRow), width);
+        out.push(isSelected ? theme.bold(truncated) : truncated);
         continue;
       }
 
@@ -1667,7 +1661,7 @@ export default function (pi: ExtensionAPI) {
 
       const iconPart = theme.fg("dim", relIcon);
       const rawLine =
-        " " +
+        (isSelected ? "❯ " : "  ") +
         swatch +
         " " +
         iconPart +
@@ -1679,7 +1673,7 @@ export default function (pi: ExtensionAPI) {
         sep +
         purposePart;
       const truncated = truncateToWidth(rawLine, width);
-      out.push(isSelected ? theme.bold(theme.bg("selectedBg", truncated)) : truncated);
+      out.push(isSelected ? theme.bold(truncated) : truncated);
     }
 
     return out;
