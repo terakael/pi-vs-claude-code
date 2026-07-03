@@ -11,13 +11,6 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { DynamicBorder } from "@mariozechner/pi-coding-agent";
-import {
-  Container,
-  type SelectItem,
-  SelectList,
-  Text,
-} from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import * as fs from "fs";
 import * as os from "os";
@@ -70,6 +63,87 @@ function shellQuote(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
 }
 
+// ── Agent file discovery ──────────────────────────────────────────────────────
+
+interface AgentDef {
+  name: string;
+  description: string;
+  tools?: string;
+  filePath: string;
+}
+
+function parseFrontmatter(content: string): Record<string, string> {
+  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  if (!match) return {};
+  const result: Record<string, string> = {};
+  for (const line of match[1].split("\n")) {
+    const colonIdx = line.indexOf(":");
+    if (colonIdx < 0) continue;
+    const key = line.slice(0, colonIdx).trim();
+    const val = line.slice(colonIdx + 1).trim();
+    if (key && val) result[key] = val;
+  }
+  return result;
+}
+
+function scanAgentDir(dir: string): AgentDef[] {
+  try {
+    return fs
+      .readdirSync(dir)
+      .filter((f) => f.endsWith(".md"))
+      .map((f) => {
+        const filePath = path.join(dir, f);
+        const content = fs.readFileSync(filePath, "utf8");
+        const fm = parseFrontmatter(content);
+        return {
+          name: fm.name ?? f.slice(0, -3),
+          description: fm.description ?? "",
+          tools: fm.tools,
+          filePath,
+        };
+      });
+  } catch {
+    return [];
+  }
+}
+
+function buildAgentsTable(defs: AgentDef[]): string {
+  if (defs.length === 0) return "";
+  let out =
+    `## Available Specialist Agents\n\n` +
+    `You have permission to spawn any of these autonomously — no need to ask first. ` +
+    `Spawned subagents are persistent: their context window stays intact between messages, so you can ` +
+    `send follow-up questions or additional tasks to the same agent via coms_send rather than spawning a new one. ` +
+    `Prefer delegation when a task is self-contained, would consume significant context, ` +
+    `or fits a specialist's profile — and treat spawned agents as long-lived collaborators rather than single-use workers.` +
+    ` Use \`subagent_create(task: "...", agent: "<name>")\` to spawn and \`coms_send\` to continue the conversation.\n\n`;
+  for (const d of defs)
+    out += `- **${d.name}**: ${d.description}\n`;
+  return out;
+}
+
+function findProjectAgentDir(): string | undefined {
+  let dir = process.cwd();
+  while (true) {
+    const candidate = path.join(dir, ".pi", "agents");
+    if (fs.existsSync(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) return undefined; // filesystem root
+    dir = parent;
+  }
+}
+
+function resolveAgentFile(name: string): string | undefined {
+  const projectDir = findProjectAgentDir();
+  if (projectDir) {
+    const local = path.join(projectDir, `${name}.md`);
+    if (fs.existsSync(local)) return local;
+  }
+  const global_ = path.join(os.homedir(), ".pi", "agent", "agents", `${name}.md`);
+  if (fs.existsSync(global_)) return global_;
+  return undefined;
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 
 interface SubState {
@@ -87,6 +161,8 @@ interface SubState {
 export default function (pi: ExtensionAPI) {
   const agents: Map<number, SubState> = new Map();
   let nextId = 1;
+  let agentDefs: AgentDef[] = [];
+  let agentsTable = "";
 
   function makeSessionFile(id: number): string {
     const dir = path.join(
@@ -118,6 +194,7 @@ export default function (pi: ExtensionAPI) {
   async function spawnSubagent(
     task: string,
     purposeOverride: string | undefined,
+    agentName: string | undefined,
     ctx: any,
   ): Promise<SubState> {
     const id = nextId++;
@@ -164,6 +241,7 @@ export default function (pi: ExtensionAPI) {
       shellQuote(sessionFile),
       "--purpose",
       shellQuote(purpose),
+
       ...(model ? ["--model", shellQuote(model)] : []),
     ].join(" ");
 
@@ -175,6 +253,7 @@ export default function (pi: ExtensionAPI) {
       `PI_PARENT_SESSION=${parentSession}`,
       "-e",
       `PI_COMS_PROJECT=${comsProject}`,
+      ...(agentName ? ["-e", `PI_AGENT_PROFILE=${agentName}`] : []),
     ];
 
     // Try to create the shared session; if it already exists (including the
@@ -203,11 +282,14 @@ export default function (pi: ExtensionAPI) {
     }
 
     await waitForComsRegistry(comsName, comsProject);
+    const taskWithReporting =
+      task +
+      `\n\nIMPORTANT: When you have completed this task, you MUST send your result back to the parent agent using the coms_send tool with target="${parentName}". Do not skip this — it is required even for simple or short tasks. Do not just reply in chat.`;
     await tmux(
       "send-keys",
       "-t",
       `${subsSession}:${tmuxWindow}`,
-      task,
+      taskWithReporting,
       "Enter",
     );
 
@@ -223,114 +305,6 @@ export default function (pi: ExtensionAPI) {
     agents.set(id, state);
     return state;
   }
-
-  // ── Navigator UI ──────────────────────────────────────────────────────────
-
-  async function openNavigator(ctx: any): Promise<void> {
-    // Prune dead sessions
-    for (const state of Array.from(agents.values())) {
-      if (!(await isAlive(state))) agents.delete(state.id);
-    }
-
-    if (agents.size === 0) {
-      ctx.ui.notify(
-        "No active subagents. Use /sub <task> to start one.",
-        "info",
-      );
-      return;
-    }
-
-    const items: SelectItem[] = Array.from(agents.values()).map((s) => ({
-      value: String(s.id),
-      label: s.task.length > 52 ? s.task.slice(0, 49) + "…" : s.task,
-      description: `#${s.id}  ·  ${s.comsName}  ·  ${Math.round((Date.now() - s.startedAt) / 1000)}s  ·  ${s.tmuxSession}`,
-    }));
-
-    const chosen = await ctx.ui.custom<string | null>(
-      (tui, theme, _kb, done) => {
-        const container = new Container();
-
-        container.addChild(
-          new DynamicBorder((s: string) => theme.fg("accent", s)),
-        );
-        container.addChild(new Text(theme.fg("accent", " Subagents"), 1, 0));
-
-        const list = new SelectList(items, Math.min(items.length + 2, 12), {
-          selectedPrefix: (t: string) => theme.fg("accent", t),
-          selectedText: (t: string) => theme.fg("accent", t),
-          description: (t: string) => theme.fg("muted", t),
-          scrollInfo: (t: string) => theme.fg("dim", t),
-          noMatch: (t: string) => theme.fg("warning", t),
-        });
-        list.onSelect = (item) => done(item.value);
-        list.onCancel = () => done(null);
-        container.addChild(list);
-
-        container.addChild(
-          new Text(
-            theme.fg("dim", " ↑↓ navigate  ·  enter open  ·  esc cancel"),
-            1,
-            0,
-          ),
-        );
-        container.addChild(
-          new DynamicBorder((s: string) => theme.fg("accent", s)),
-        );
-
-        return {
-          render: (w: number) => container.render(w),
-          invalidate: () => container.invalidate(),
-          handleInput: (data: string) => {
-            list.handleInput(data);
-            tui.requestRender();
-          },
-        };
-      },
-      { overlay: true },
-    );
-
-    if (chosen !== null) {
-      const state = agents.get(parseInt(chosen));
-      if (state) {
-        // Switch the current terminal client into the subagent's tmux session.
-        // Use ctrl+b L (last session) or ctrl+b s (session picker) to return.
-        await tmux(
-          "switch-client",
-          "-t",
-          `${state.tmuxSession}:${state.tmuxWindow}`,
-        );
-      }
-    }
-  }
-
-  // ── /sub ──────────────────────────────────────────────────────────────────
-
-  pi.registerCommand("sub", {
-    description:
-      "Spawn a subagent (/sub <task>) or navigate running ones (/sub)",
-    handler: async (args, ctx) => {
-      if (!process.env.TMUX) {
-        ctx.ui.notify(
-          "Not in a tmux session — start pi inside tmux to use /sub.",
-          "warning",
-        );
-        return;
-      }
-
-      const task = args?.trim();
-
-      if (task) {
-        const state = await spawnSubagent(task, ctx);
-        ctx.ui.notify(
-          `Subagent #${state.id}  ·  ${state.tmuxSession}:${state.tmuxWindow}  ·  coms: ${state.comsName}`,
-          "success",
-        );
-        return;
-      }
-
-      await openNavigator(ctx);
-    },
-  });
 
   // ── LLM tools ─────────────────────────────────────────────────────────────
 
@@ -349,6 +323,12 @@ export default function (pi: ExtensionAPI) {
             "Short label (≤80 chars) shown in the coms pool widget. Defaults to the first 80 chars of task.",
         }),
       ),
+      agent: Type.Optional(
+        Type.String({
+          description:
+            "Name of a specialist agent profile to apply (stem of a .md file in .pi/agents/ or ~/.pi/agent/agents/). The file's full contents are appended to the subagent's system prompt.",
+        }),
+      ),
     }),
     execute: async (_callId, args, _signal, _onUpdate, ctx) => {
       if (!process.env.TMUX) {
@@ -361,7 +341,17 @@ export default function (pi: ExtensionAPI) {
           ],
         };
       }
-      const state = await spawnSubagent(args.task, args.purpose, ctx);
+        if (args.agent && !resolveAgentFile(args.agent)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Agent profile "${args.agent}" not found in .pi/agents/ or ~/.pi/agent/agents/.`,
+            },
+          ],
+        };
+      }
+      const state = await spawnSubagent(args.task, args.purpose, args.agent, ctx);
       return {
         content: [
           {
@@ -396,21 +386,44 @@ export default function (pi: ExtensionAPI) {
 
   // ── Session lifecycle ─────────────────────────────────────────────────────
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (_event, _ctx) => {
     agents.clear();
     nextId = 1;
 
-    // If we were spawned as a subagent, register a shortcut to jump back
-    // to the parent tmux session and inject a standing system-prompt
+    // Scan agent profile dirs — project-local first, then global.
+    // Deduplicate by name: project-local files shadow global ones.
+    const cwd = process.cwd();
+    const localDefs = scanAgentDir(findProjectAgentDir() ?? "");
+    const globalDefs = scanAgentDir(
+      path.join(os.homedir(), ".pi", "agent", "agents"),
+    );
+    const seen = new Set(localDefs.map((d) => d.name));
+    agentDefs = [...localDefs, ...globalDefs.filter((d) => !seen.has(d.name))];
+    agentsTable = buildAgentsTable(agentDefs);
+
+    // If we were spawned as a subagent, inject a standing system-prompt
     // instruction to always report results back via coms_send.
     const ownComsName = process.env.PI_COMS_NAME;
     const isSubagent = !!process.env.PI_PARENT_SESSION;
-    // Read --project from argv directly: pi.getFlag only works within the registering
-    // extension's instance, not across co-loaded extensions.
     const projectArgIdx = process.argv.indexOf("--project");
-    const projectArgVal = projectArgIdx >= 0 ? process.argv[projectArgIdx + 1] : undefined;
+    const projectArgVal =
+      projectArgIdx >= 0 ? process.argv[projectArgIdx + 1] : undefined;
     const parentComsName =
-      isSubagent && projectArgVal && projectArgVal !== "default" ? projectArgVal : undefined;
+      isSubagent && projectArgVal && projectArgVal !== "default"
+        ? projectArgVal
+        : undefined;
+
+    // If spawned with a named agent profile, read + strip frontmatter once.
+    const agentProfileName = process.env.PI_AGENT_PROFILE;
+    let agentProfileBody: string | undefined;
+    if (agentProfileName) {
+      const profilePath = resolveAgentFile(agentProfileName);
+      if (profilePath) {
+        const raw = fs.readFileSync(profilePath, "utf8");
+        // Strip YAML frontmatter (--- ... ---) and trim leading whitespace.
+        agentProfileBody = raw.replace(/^---[\s\S]*?\n---\n?/, "").trimStart();
+      }
+    }
 
     pi.on("before_agent_start", async (event) => {
       let sp = event.systemPrompt;
@@ -419,6 +432,12 @@ export default function (pi: ExtensionAPI) {
       }
       if (isSubagent) {
         sp += ` You are a subagent. When you have completed your task, you MUST send your result back to your parent agent using the coms_send tool with target="${parentComsName}". Do not finish without doing this.`;
+      }
+      if (agentProfileBody) {
+        sp += `\n\n## Agent Profile: ${agentProfileName}\n\n${agentProfileBody}`;
+      }
+      if (agentsTable) {
+        sp += `\n\n${agentsTable}`;
       }
       return { systemPrompt: sp };
     });

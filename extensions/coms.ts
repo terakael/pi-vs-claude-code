@@ -608,6 +608,8 @@ class ComsNavEditor extends CustomEditor {
     private _tui: any,
     theme: any,
     keybindings: any,
+    private agentName: string,
+    private getStats: () => { model: string | undefined; contextPct: number | null | undefined },
     private getRows: () => string[],
     private getSelected: () => number,
     private setSelected: (n: number) => void,
@@ -685,6 +687,21 @@ class ComsNavEditor extends CustomEditor {
 
   override render(width: number): string[] {
     const lines = super.render(width);
+    if (lines.length > 0) {
+      const last = lines.length - 1;
+      const borderLine = lines[last]!;
+      const dashIdx = borderLine.indexOf("─");
+      const borderStyle = dashIdx > 0 ? borderLine.slice(0, dashIdx) : "";
+      const d = borderStyle ? `${borderStyle}─\x1b[0m` : "─";
+      const left = `${d} 📡 ${this.agentName} `;
+      const { model, contextPct } = this.getStats();
+      const pct = contextPct != null ? `${Math.round(contextPct)}%` : "?%";
+      const right = ` ${model ?? ""} ${d} ${pct} ${d}`;
+      const lw = visibleWidth(left);
+      const rw = visibleWidth(right);
+      const mid = truncateToWidth(lines[last]!, width - lw - rw, "");
+      lines[last] = left + mid + right;
+    }
     if (!this.leaderActive) return lines;
     return lines.map((line) => this.styleLeaderLine(line));
   }
@@ -895,6 +912,27 @@ export default function (pi: ExtensionAPI) {
       card.is_blocked = msg.is_blocked ?? false;
       updateSpinnerTimer();
       currentTui?.requestRender?.();
+    } else {
+      // Unknown session — new peer or reloaded peer with new session_id.
+      // Registry was written before the broadcast; look it up directly.
+      const entry = readAllDisplayEntries().find((e) => e.session_id === sid);
+      if (entry) {
+        peerCards.set(sid, {
+          session_id: sid,
+          name: entry.name,
+          purpose: entry.purpose,
+          model: entry.model,
+          color: entry.color,
+          cwd: entry.cwd,
+          endpoint: entry.endpoint,
+          is_running: msg.is_running ?? false,
+          is_blocked: msg.is_blocked ?? false,
+          context_used_pct: null,
+          staleCount: 0,
+        });
+        updateSpinnerTimer();
+        currentTui?.requestRender?.();
+      }
     }
   }
 
@@ -1089,7 +1127,8 @@ export default function (pi: ExtensionAPI) {
             flags.name || fm.name || "",
             flags.name || fm.name || "",
           )
-        : pickLevelOneName(liveNames);
+        : process.env.PI_COMS_NAME  // preserved across /reload — reuse same name
+          ?? pickLevelOneName(liveNames);
     const name = defaultName;
     const purpose = flags.purpose || fm.description || "";
 
@@ -1247,6 +1286,8 @@ export default function (pi: ExtensionAPI) {
           tui,
           theme,
           kb,
+          name,
+          () => ({ model: ctx.model?.name, contextPct: ctx.getContextUsage()?.percent }),
           () => buildPoolRows().map((r) => r.name),
           () => selectedIndex,
           (n) => {
@@ -1275,7 +1316,10 @@ export default function (pi: ExtensionAPI) {
       // hasUI may be false in some contexts — non-fatal.
     }
 
-    // 7. Start ping + keepalive cycles.
+    // 7. Announce presence to peers immediately — no need to wait for first ping cycle.
+    broadcastStatus(false).catch(() => {});
+
+    // 8. Start ping + keepalive cycles.
     pingTimer = setInterval(() => {
       refreshPool().catch(() => {});
     }, PING_INTERVAL_MS);
@@ -1598,7 +1642,7 @@ export default function (pi: ExtensionAPI) {
       if (r.stale) {
         const dimRow = `✗ ${relIcon}${r.name.padEnd(11)} ${abbreviateModel(r.model).padEnd(16)}  ${pctLabel.padStart(4)}  —  ${r.purpose || ""}`;
         const truncated = truncateToWidth(" " + theme.fg("dim", dimRow), width);
-        out.push(isSelected ? theme.bg("selectedBg", truncated) : truncated);
+        out.push(isSelected ? theme.bold(theme.bg("selectedBg", truncated)) : truncated);
         continue;
       }
 
@@ -1635,7 +1679,7 @@ export default function (pi: ExtensionAPI) {
         sep +
         purposePart;
       const truncated = truncateToWidth(rawLine, width);
-      out.push(isSelected ? theme.bg("selectedBg", truncated) : truncated);
+      out.push(isSelected ? theme.bold(theme.bg("selectedBg", truncated)) : truncated);
     }
 
     return out;
