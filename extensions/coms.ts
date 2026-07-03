@@ -771,6 +771,20 @@ export default function (pi: ExtensionAPI) {
     tmux_window?: string;
     tmux_pane?: string;
   } | null = null;
+
+  // Register once at extension-init level (not inside session_start) so it
+  // doesn't stack on reloads. Reads `identity` at exit time — always current
+  // because identity is a mutable let in this closure.
+  // Covers every exit path including Pi's emergencyTerminalExit → process.exit(129)
+  // (dead pty on kill-pane / kill-window), which skips session_shutdown entirely.
+  process.on("exit", () => {
+    if (identity) {
+      try {
+        spawnSync("tmux", ["kill-session", "-t", `${identity.name}-subs`]);
+      } catch { /* ignore */ }
+    }
+  });
+
   const peerCards: Map<string, AgentCard & { staleCount: number }> = new Map();
   let server: net.Server | null = null;
   let pingTimer: NodeJS.Timeout | null = null;
@@ -1647,6 +1661,8 @@ export default function (pi: ExtensionAPI) {
         currentCtx?.ui?.notify?.(`coms: couldn't close ${name}`, "error");
         return;
       }
+      // Cascade — kill the target's subs session so its subagents die too.
+      spawnSync("tmux", ["kill-session", "-t", `${name}-subs`]);
       // Broadcast the goodbye on behalf of the dead peer — we're still alive
       // so there's no shutdown timing issue. All peers drop the card immediately.
       if (target?.session_id) {
@@ -2189,6 +2205,13 @@ export default function (pi: ExtensionAPI) {
   async function cleanShutdown(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
+    // Cascade shutdown to subagents — kill the subs tmux session before any
+    // await so this runs synchronously even under abrupt kill (SIGHUP/SIGTERM).
+    if (identity) {
+      try {
+        spawnSync("tmux", ["kill-session", "-t", `${identity.name}-subs`]);
+      } catch { /* no subs session — ignore */ }
+    }
     await broadcastStatus(false, true);
     if (pingTimer) {
       try {
@@ -2284,7 +2307,8 @@ export default function (pi: ExtensionAPI) {
   process.on("SIGTERM", () => {
     void cleanShutdown();
   });
-  process.on("SIGHUP", () => {
-    void cleanShutdown();
-  });
+  // SIGHUP dropped — Pi prependListener's its own SIGHUP handler which awaits
+  // session_shutdown (graceful path) or calls process.exit(129) via
+  // emergencyTerminalExit (dead pty). Both paths are covered: session_shutdown
+  // runs cleanShutdown, and process.exit triggers the exit listener above.
 }
