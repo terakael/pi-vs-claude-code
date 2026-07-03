@@ -122,7 +122,10 @@ export default function (pi: ExtensionAPI) {
     const id = nextId++;
     const sessionFile = makeSessionFile(id);
     const comsName = `${process.env.PI_COMS_NAME ?? "agent"}-sub-${id}`;
-    const comsProject = process.env.PI_COMS_PROJECT ?? "default";
+    // Subagents always join the parent's own-name pool, regardless of what
+    // named pool the parent is in. This keeps subagents invisible to other
+    // named-pool peers while still reachable by the parent.
+    const comsProject = process.env.PI_COMS_NAME ?? "agent";
     const model = ctx.model
       ? `${ctx.model.provider}/${ctx.model.id}`
       : undefined;

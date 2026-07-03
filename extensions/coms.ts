@@ -737,7 +737,7 @@ export default function (pi: ExtensionAPI) {
     cwd: string;
     model: string;
     endpoint: string;
-    registryFile: string;
+    registryFiles: string[];
     tmux_session?: string;
     tmux_window?: string;
     tmux_pane?: string;
@@ -747,7 +747,7 @@ export default function (pi: ExtensionAPI) {
   let pingTimer: NodeJS.Timeout | null = null;
   let keepaliveTimer: NodeJS.Timeout | null = null;
   let includeExplicit = false;
-  let displayProject: string | null = null;
+  let extraProjects: string[] = [];
   let currentCtx: ExtensionContext | null = null;
   let currentInbound: InboundContext | null = null;
   let selectedIndex = -1;
@@ -757,6 +757,28 @@ export default function (pi: ExtensionAPI) {
   let spinnerFrame = 0;
   let spinnerTimer: NodeJS.Timeout | null = null;
   let currentTui: any = null;
+
+  // All pools this agent is registered in and reads from.
+  // Always includes identity.project (own-name pool); extraProjects adds named pools.
+  function allProjects(): string[] {
+    if (!identity) return [];
+    return [identity.project, ...extraProjects.filter((p) => p !== identity!.project)];
+  }
+
+  // Read registry entries across all display pools, deduplicated by session_id.
+  function readAllDisplayEntries(): RegistryEntry[] {
+    const seen = new Set<string>();
+    const out: RegistryEntry[] = [];
+    for (const p of allProjects()) {
+      for (const e of readAllRegistryEntries(p)) {
+        if (!seen.has(e.session_id)) {
+          seen.add(e.session_id);
+          out.push(e);
+        }
+      }
+    }
+    return out;
+  }
 
   // Phase A stub handlers — each just acks valid envelopes. Phase B replaces these.
   function ackOk(socket: net.Socket, msg_id: string): void {
@@ -874,8 +896,7 @@ export default function (pi: ExtensionAPI) {
 
   function broadcastPeerClosed(deadSessionId: string): Promise<void> {
     if (!identity) return Promise.resolve();
-    const projectFilter = identity.project ?? "default";
-    const entries = readAllRegistryEntries(projectFilter);
+    const entries = readAllDisplayEntries();
     const payload =
       JSON.stringify({
         type: "status",
@@ -919,8 +940,7 @@ export default function (pi: ExtensionAPI) {
     closing = false,
   ): Promise<void> {
     if (!identity) return Promise.resolve();
-    const projectFilter = identity.project ?? "default";
-    const entries = readAllRegistryEntries(projectFilter);
+    const entries = readAllDisplayEntries();
     const payload =
       JSON.stringify({
         type: "status",
@@ -1053,20 +1073,22 @@ export default function (pi: ExtensionAPI) {
     // 1. Resolve identity from CLI flags > frontmatter > defaults.
     const flags = readCliFlags(pi);
     const fm = readFrontmatterFromArgv(process.argv);
-    const project = flags.project || "default";
+    const namedProject = flags.project && flags.project !== "default" ? flags.project : null;
     const explicit = flags.explicit === true;
     const session_id = ulid();
 
     const defaultName = `agent-${session_id.slice(-6)}`;
     const desiredName = flags.name || fm.name || defaultName;
-    const name = resolveUniqueName(project, desiredName);
+    // Primary pool is always the agent's own coms name.
+    // resolveUniqueName uses the own-name pool for collision checks.
+    const name = resolveUniqueName(desiredName, desiredName);
     if (name !== desiredName) {
       try {
         pi.appendEntry("coms-log", {
           event: "name_collision",
           desired: desiredName,
           assigned: name,
-          project,
+          project: name,
         });
       } catch {
         // best-effort
@@ -1113,9 +1135,10 @@ export default function (pi: ExtensionAPI) {
 
     // 2. Ensure storage dirs exist.
     try {
-      fs.mkdirSync(path.join(COMS_DIR, "projects", project, "agents"), {
-        recursive: true,
-      });
+      const poolsToInit = namedProject ? [name, namedProject] : [name];
+      for (const p of poolsToInit) {
+        fs.mkdirSync(path.join(COMS_DIR, "projects", p, "agents"), { recursive: true });
+      }
       if (process.platform !== "win32") {
         fs.mkdirSync(path.join(COMS_DIR, "sockets"), { recursive: true });
         try {
@@ -1160,9 +1183,11 @@ export default function (pi: ExtensionAPI) {
       tmux_window: tmuxWindow,
       tmux_pane: tmuxPane,
     };
-    let registryFile: string;
+    let registryFiles: string[];
     try {
-      registryFile = writeRegistryAtomic(entry, project);
+      // Always write to own-name pool. Also write to named project if specified.
+      const poolsToWrite = namedProject ? [name, namedProject] : [name];
+      registryFiles = poolsToWrite.map((p) => writeRegistryAtomic(entry, p));
     } catch (err) {
       ctx.ui?.notify?.(
         `📡 coms: registry write failed — ${err instanceof Error ? err.message : String(err)}`,
@@ -1181,32 +1206,32 @@ export default function (pi: ExtensionAPI) {
       name,
       purpose,
       color,
-      project,
+      project: name,          // primary pool = own coms name
       explicit,
       cwd,
       model,
       endpoint,
-      registryFile,
+      registryFiles,
       tmux_session: tmuxSession,
       tmux_window: tmuxWindow,
       tmux_pane: tmuxPane,
     };
     includeExplicit = false;
-    displayProject = project;
+    extraProjects = namedProject ? [namedProject] : [];
     // Expose identity so co-loaded extensions (subagent-widget etc.) can read it.
-    process.env.PI_COMS_PROJECT = project;
+    process.env.PI_COMS_PROJECT = name;
     process.env.PI_COMS_NAME = name;
 
     // 5. Audit log: boot.
     try {
-      pi.appendEntry("coms-log", { event: "boot", session_id, name, project });
+      pi.appendEntry("coms-log", { event: "boot", session_id, name, project: name, extra_projects: extraProjects });
     } catch {
       // best-effort
     }
 
     // 6. Surface presence in the UI + install the live pool widget.
     try {
-      ctx.ui.setStatus("coms", `📡 ${name}@${project}`);
+      ctx.ui.setStatus("coms", `📡 ${name}@${name}${namedProject ? `+${namedProject}` : ""}`);
       installPoolWidget(ctx);
       ctx.ui.setEditorComponent((tui, theme, kb) => {
         currentTui = tui;
@@ -1224,7 +1249,7 @@ export default function (pi: ExtensionAPI) {
           new Map([["h", toggleWidget]]),
           (active) => {
             if (!identity || !currentCtx?.hasUI) return;
-            const base = `📡 ${identity.name}@${identity.project}`;
+            const base = `📡 ${identity.name}`;
             try {
               currentCtx.ui.setStatus("coms", active ? `${base} [C-x]` : base);
             } catch {
@@ -1235,7 +1260,7 @@ export default function (pi: ExtensionAPI) {
         );
       });
       ctx.ui.notify(
-        `📡 coms ready · ${name}@${project} · ${displayProject ?? project} pool`,
+        `📡 coms ready · ${name} · pools: ${allProjects().join(", ")}`,
         "info",
       );
     } catch {
@@ -1257,7 +1282,7 @@ export default function (pi: ExtensionAPI) {
         const ctx = currentCtx;
         // Detect missing-registry BEFORE writing so the self_heal audit only
         // fires when something actually went wrong (file unlinked under us).
-        const missingBeforeWrite = !fs.existsSync(identity.registryFile);
+        const missingBeforeWrite = identity.registryFiles.some((f) => !fs.existsSync(f));
         const live: RegistryEntry = {
           session_id: identity.session_id,
           name: identity.name,
@@ -1276,21 +1301,16 @@ export default function (pi: ExtensionAPI) {
           tmux_window: identity.tmux_window,
           tmux_pane: identity.tmux_pane,
         };
-        // Unconditional atomic write: handles BOTH the live-status refresh
-        // (file present → overwrite with fresh values) AND self-heal (file
-        // missing → re-create entry). The atomic write also bumps mtime, so
-        // keepaliveTouch is now redundant.
-        writeRegistryAtomic(live, identity.project);
+        // Write to all pools on every keepalive tick.
+        for (const p of allProjects()) writeRegistryAtomic(live, p);
         if (missingBeforeWrite) {
           pi.appendEntry("coms-log", {
             event: "self_heal",
             session_id: identity.session_id,
             reason: "registry file missing",
           });
-          // Edge case: if the file was unlinked again between our write and
-          // this check, re-write once to be safe.
-          if (!fs.existsSync(identity.registryFile)) {
-            writeRegistryAtomic(live, identity.project);
+          if (identity.registryFiles.some((f) => !fs.existsSync(f))) {
+            for (const p of allProjects()) writeRegistryAtomic(live, p);
           }
         }
       } catch {
@@ -1371,11 +1391,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   function buildPoolRows(): PoolRow[] {
-    const projectFilter = displayProject ?? identity?.project ?? "default";
-    const registryEntries =
-      projectFilter === "*"
-        ? readAllRegistryEntriesAcrossProjects()
-        : readAllRegistryEntries(projectFilter);
+    const registryEntries = includeExplicit
+      ? readAllRegistryEntriesAcrossProjects()
+      : readAllDisplayEntries();
 
     const rows: PoolRow[] = [];
     const seenSessions = new Set<string>();
@@ -1633,11 +1651,14 @@ export default function (pi: ExtensionAPI) {
   // ━━ Ping cycle ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   async function refreshPool(): Promise<void> {
     if (!identity) return;
-    const projectFilter = displayProject ?? identity.project;
-    const live =
-      projectFilter === "*"
-        ? pruneDeadEntriesAllProjects()
-        : pruneDeadEntries(projectFilter);
+    // Prune dead entries across all display pools, deduped by session_id.
+    const seen = new Set<string>();
+    const live: RegistryEntry[] = [];
+    for (const p of allProjects()) {
+      for (const e of pruneDeadEntries(p)) {
+        if (!seen.has(e.session_id)) { seen.add(e.session_id); live.push(e); }
+      }
+    }
 
     const peers = live.filter(
       (e) =>
@@ -1712,22 +1733,17 @@ export default function (pi: ExtensionAPI) {
   }
 
   function resolveTarget(target: string): RegistryEntry | null {
-    // Prefer name match within current project.
-    if (identity) {
-      const localEntries = pruneDeadEntries(identity.project);
-      const byName = localEntries.find((e) => e.name === target);
-      if (byName) return byName;
-    }
-    // Fall back to scanning all projects by session_id (or name as last resort).
+    // Search display pools first (own-name + extra).
+    const displayEntries = readAllDisplayEntries();
+    const byName = displayEntries.find((e) => e.name === target);
+    if (byName) return byName;
+    const bySession = displayEntries.find((e) => e.session_id === target);
+    if (bySession) return bySession;
+    // Fall back to scanning all projects.
     for (const proj of listProjects()) {
       const entries = pruneDeadEntries(proj);
-      const bySession = entries.find((e) => e.session_id === target);
-      if (bySession) return bySession;
-    }
-    for (const proj of listProjects()) {
-      const entries = pruneDeadEntries(proj);
-      const byName = entries.find((e) => e.name === target);
-      if (byName) return byName;
+      const e = entries.find((e) => e.session_id === target || e.name === target);
+      if (e) return e;
     }
     return null;
   }
@@ -1756,14 +1772,20 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_callId, params) {
       const includeExp = params.include_explicit === true;
-      const projectFilter = params.project ?? identity?.project ?? "default";
-      const projects = projectFilter === "*" ? listProjects() : [projectFilter];
+      const projects = params.project === "*"
+        ? listProjects()
+        : params.project
+          ? [params.project]
+          : allProjects();
 
+      const seen = new Set<string>();
       const collected: { entry: RegistryEntry; project: string }[] = [];
       for (const proj of projects) {
         for (const entry of pruneDeadEntries(proj)) {
           if (entry.explicit && !includeExp) continue;
           if (identity && entry.session_id === identity.session_id) continue;
+          if (seen.has(entry.session_id)) continue;
+          seen.add(entry.session_id);
           collected.push({ entry, project: proj });
         }
       }
@@ -1992,9 +2014,29 @@ export default function (pi: ExtensionAPI) {
       }
       const projectMatch = trimmed.match(/--project\s+(\S+)/);
       if (projectMatch) {
-        displayProject = projectMatch[1];
+        const p = projectMatch[1]!;
+        if (!extraProjects.includes(p)) {
+          extraProjects.push(p);
+          // Also write our registry entry into the new pool so peers there can find us.
+          if (identity) {
+            const live: RegistryEntry = {
+              session_id: identity.session_id,
+              name: identity.name,
+              purpose: identity.purpose,
+              model: identity.model,
+              color: identity.color,
+              pid: process.pid,
+              endpoint: identity.endpoint,
+              cwd: identity.cwd,
+              started_at: nowIso(),
+              explicit: identity.explicit,
+              version: 1,
+            };
+            try { writeRegistryAtomic(live, p); } catch { /* ignore */ }
+          }
+        }
         try {
-          ctx.ui.notify(`coms: displaying project ${displayProject}`, "info");
+          ctx.ui.notify(`coms: joined project ${p} · pools: ${allProjects().join(", ")}`, "info");
         } catch {
           /* ignore */
         }
@@ -2050,7 +2092,9 @@ export default function (pi: ExtensionAPI) {
         }
       }
       try {
-        removeRegistryEntry(identity.project, identity.name);
+        for (const p of allProjects()) {
+          try { removeRegistryEntry(p, identity.name); } catch { /* ignore */ }
+        }
       } catch {
         /* ignore */
       }
