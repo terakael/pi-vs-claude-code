@@ -34,6 +34,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as crypto from "node:crypto";
+import { pickLevelOneName } from "./naming.ts";
 
 // ━━ Constants ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -762,7 +763,10 @@ export default function (pi: ExtensionAPI) {
   // Always includes identity.project (own-name pool); extraProjects adds named pools.
   function allProjects(): string[] {
     if (!identity) return [];
-    return [identity.project, ...extraProjects.filter((p) => p !== identity!.project)];
+    return [
+      identity.project,
+      ...extraProjects.filter((p) => p !== identity!.project),
+    ];
   }
 
   // Read registry entries across all display pools, deduplicated by session_id.
@@ -1073,27 +1077,20 @@ export default function (pi: ExtensionAPI) {
     // 1. Resolve identity from CLI flags > frontmatter > defaults.
     const flags = readCliFlags(pi);
     const fm = readFrontmatterFromArgv(process.argv);
-    const namedProject = flags.project && flags.project !== "default" ? flags.project : null;
+    const namedProject =
+      flags.project && flags.project !== "default" ? flags.project : null;
     const explicit = flags.explicit === true;
     const session_id = ulid();
 
-    const defaultName = `agent-${session_id.slice(-6)}`;
-    const desiredName = flags.name || fm.name || defaultName;
-    // Primary pool is always the agent's own coms name.
-    // resolveUniqueName uses the own-name pool for collision checks.
-    const name = resolveUniqueName(desiredName, desiredName);
-    if (name !== desiredName) {
-      try {
-        pi.appendEntry("coms-log", {
-          event: "name_collision",
-          desired: desiredName,
-          assigned: name,
-          project: name,
-        });
-      } catch {
-        // best-effort
-      }
-    }
+    const liveNames = new Set(pruneDeadEntriesAllProjects().map((e) => e.name));
+    const defaultName =
+      flags.name || fm.name
+        ? resolveUniqueName(
+            flags.name || fm.name || "",
+            flags.name || fm.name || "",
+          )
+        : pickLevelOneName(liveNames);
+    const name = defaultName;
     const purpose = flags.purpose || fm.description || "";
 
     // Color: validate at every level; fall through invalid hex to next.
@@ -1137,7 +1134,9 @@ export default function (pi: ExtensionAPI) {
     try {
       const poolsToInit = namedProject ? [name, namedProject] : [name];
       for (const p of poolsToInit) {
-        fs.mkdirSync(path.join(COMS_DIR, "projects", p, "agents"), { recursive: true });
+        fs.mkdirSync(path.join(COMS_DIR, "projects", p, "agents"), {
+          recursive: true,
+        });
       }
       if (process.platform !== "win32") {
         fs.mkdirSync(path.join(COMS_DIR, "sockets"), { recursive: true });
@@ -1206,7 +1205,7 @@ export default function (pi: ExtensionAPI) {
       name,
       purpose,
       color,
-      project: name,          // primary pool = own coms name
+      project: name, // primary pool = own coms name
       explicit,
       cwd,
       model,
@@ -1224,14 +1223,23 @@ export default function (pi: ExtensionAPI) {
 
     // 5. Audit log: boot.
     try {
-      pi.appendEntry("coms-log", { event: "boot", session_id, name, project: name, extra_projects: extraProjects });
+      pi.appendEntry("coms-log", {
+        event: "boot",
+        session_id,
+        name,
+        project: name,
+        extra_projects: extraProjects,
+      });
     } catch {
       // best-effort
     }
 
     // 6. Surface presence in the UI + install the live pool widget.
     try {
-      ctx.ui.setStatus("coms", `📡 ${name}@${name}${namedProject ? `+${namedProject}` : ""}`);
+      ctx.ui.setStatus(
+        "coms",
+        `📡 ${name}@${name}${namedProject ? `+${namedProject}` : ""}`,
+      );
       installPoolWidget(ctx);
       ctx.ui.setEditorComponent((tui, theme, kb) => {
         currentTui = tui;
@@ -1282,7 +1290,9 @@ export default function (pi: ExtensionAPI) {
         const ctx = currentCtx;
         // Detect missing-registry BEFORE writing so the self_heal audit only
         // fires when something actually went wrong (file unlinked under us).
-        const missingBeforeWrite = identity.registryFiles.some((f) => !fs.existsSync(f));
+        const missingBeforeWrite = identity.registryFiles.some(
+          (f) => !fs.existsSync(f),
+        );
         const live: RegistryEntry = {
           session_id: identity.session_id,
           name: identity.name,
@@ -1368,12 +1378,13 @@ export default function (pi: ExtensionAPI) {
     myName: string,
     peerName: string,
   ): "parent" | "child" | "sibling" | "peer" {
-    if (peerName.startsWith(myName + "-sub-")) return "child";
-    if (myName.startsWith(peerName + "-sub-")) return "parent";
-    const myBase = myName.replace(/-sub-\d+$/, "");
-    const peerBase = peerName.replace(/-sub-\d+$/, "");
-    if (myBase !== myName && peerBase !== peerName && myBase === peerBase)
-      return "sibling";
+    // Hierarchy is now encoded by prefix nesting (Docker-style levels)
+    // e.g. parent="amber", child="amber-basin", sibling1="amber-basin", sibling2="amber-grove"
+    if (peerName.startsWith(myName + "-")) return "child";
+    if (myName.startsWith(peerName + "-")) return "parent";
+    const myParent = myName.split("-").slice(0, -1).join("-");
+    const peerParent = peerName.split("-").slice(0, -1).join("-");
+    if (myParent && peerParent && myParent === peerParent) return "sibling";
     return "peer";
   }
 
@@ -1656,7 +1667,10 @@ export default function (pi: ExtensionAPI) {
     const live: RegistryEntry[] = [];
     for (const p of allProjects()) {
       for (const e of pruneDeadEntries(p)) {
-        if (!seen.has(e.session_id)) { seen.add(e.session_id); live.push(e); }
+        if (!seen.has(e.session_id)) {
+          seen.add(e.session_id);
+          live.push(e);
+        }
       }
     }
 
@@ -1742,7 +1756,9 @@ export default function (pi: ExtensionAPI) {
     // Fall back to scanning all projects.
     for (const proj of listProjects()) {
       const entries = pruneDeadEntries(proj);
-      const e = entries.find((e) => e.session_id === target || e.name === target);
+      const e = entries.find(
+        (e) => e.session_id === target || e.name === target,
+      );
       if (e) return e;
     }
     return null;
@@ -1772,16 +1788,17 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_callId, params) {
       const includeExp = params.include_explicit === true;
-      const projects = params.project === "*"
-        ? listProjects()
-        : params.project
-          ? [params.project]
-          : allProjects();
+      const projects =
+        params.project === "*"
+          ? listProjects()
+          : params.project
+            ? [params.project]
+            : allProjects();
 
       const seen = new Set<string>();
       const collected: { entry: RegistryEntry; project: string }[] = [];
       for (const proj of projects) {
-        for (const entry of pruneDeadEntries(proj)) {
+        for (const entry of readAllRegistryEntries(proj)) {
           if (entry.explicit && !includeExp) continue;
           if (identity && entry.session_id === identity.session_id) continue;
           if (seen.has(entry.session_id)) continue;
@@ -1790,7 +1807,8 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // Ping each peer in parallel for live context usage.
+      // Ping each candidate in parallel; include ALL entries, annotate with alive status.
+      // Never filter by ping — a slow or starting peer shouldn't be hidden from the LLM.
       const pongs = await Promise.allSettled(
         collected.map((c) => pingPeer(c.entry.endpoint)),
       );
@@ -1832,7 +1850,7 @@ export default function (pi: ExtensionAPI) {
             text: `${agents.length} peer(s):\n${lines}`,
           },
         ],
-        details: { agents, project: projectFilter },
+        details: { agents, project: params.project ?? null },
       };
     },
     renderCall(args, theme) {
@@ -2032,11 +2050,18 @@ export default function (pi: ExtensionAPI) {
               explicit: identity.explicit,
               version: 1,
             };
-            try { writeRegistryAtomic(live, p); } catch { /* ignore */ }
+            try {
+              writeRegistryAtomic(live, p);
+            } catch {
+              /* ignore */
+            }
           }
         }
         try {
-          ctx.ui.notify(`coms: joined project ${p} · pools: ${allProjects().join(", ")}`, "info");
+          ctx.ui.notify(
+            `coms: joined project ${p} · pools: ${allProjects().join(", ")}`,
+            "info",
+          );
         } catch {
           /* ignore */
         }
@@ -2093,7 +2118,11 @@ export default function (pi: ExtensionAPI) {
       }
       try {
         for (const p of allProjects()) {
-          try { removeRegistryEntry(p, identity.name); } catch { /* ignore */ }
+          try {
+            removeRegistryEntry(p, identity.name);
+          } catch {
+            /* ignore */
+          }
         }
       } catch {
         /* ignore */

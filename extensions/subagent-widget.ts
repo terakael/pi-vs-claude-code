@@ -22,6 +22,7 @@ import { Type } from "@sinclair/typebox";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { pickSubagentName } from "./naming.ts";
 
 const { execFile } = require("child_process") as typeof import("child_process");
 
@@ -76,7 +77,7 @@ interface SubState {
   task: string;
   tmuxSession: string; // shared subs session, e.g. "main-subs"
   tmuxWindow: string; // per-subagent window name = comsName
-  comsName: string; // coms identity, e.g. "agent-X7K2M9-sub-1"
+  comsName: string; // coms identity, e.g. "amber-basin"
   sessionFile: string;
   startedAt: number;
 }
@@ -121,11 +122,21 @@ export default function (pi: ExtensionAPI) {
   ): Promise<SubState> {
     const id = nextId++;
     const sessionFile = makeSessionFile(id);
-    const comsName = `${process.env.PI_COMS_NAME ?? "agent"}-sub-${id}`;
+    const parentName = process.env.PI_COMS_NAME ?? "agent";
+    // Scan parent's pool to find live names for collision avoidance.
+    const comsDir = process.env.PI_COMS_DIR || path.join(os.homedir(), ".pi", "coms");
+    const poolDir = path.join(comsDir, "projects", parentName, "agents");
+    const existingNames = new Set<string>();
+    try {
+      for (const f of fs.readdirSync(poolDir)) {
+        if (f.endsWith(".json")) existingNames.add(f.slice(0, -5));
+      }
+    } catch { /* pool dir may not exist yet */ }
+    const comsName = pickSubagentName(parentName, existingNames);
     // Subagents always join the parent's own-name pool, regardless of what
     // named pool the parent is in. This keeps subagents invisible to other
     // named-pool peers while still reachable by the parent.
-    const comsProject = process.env.PI_COMS_NAME ?? "agent";
+    const comsProject = parentName;
     const model = ctx.model
       ? `${ctx.model.provider}/${ctx.model.id}`
       : undefined;
@@ -393,8 +404,13 @@ export default function (pi: ExtensionAPI) {
     // to the parent tmux session and inject a standing system-prompt
     // instruction to always report results back via coms_send.
     const ownComsName = process.env.PI_COMS_NAME;
-    const parentComsName = ownComsName?.replace(/-sub-\d+$/, "");
-    const isSubagent = parentComsName && parentComsName !== ownComsName;
+    const isSubagent = !!process.env.PI_PARENT_SESSION;
+    // Read --project from argv directly: pi.getFlag only works within the registering
+    // extension's instance, not across co-loaded extensions.
+    const projectArgIdx = process.argv.indexOf("--project");
+    const projectArgVal = projectArgIdx >= 0 ? process.argv[projectArgIdx + 1] : undefined;
+    const parentComsName =
+      isSubagent && projectArgVal && projectArgVal !== "default" ? projectArgVal : undefined;
 
     pi.on("before_agent_start", async (event) => {
       let sp = event.systemPrompt;
