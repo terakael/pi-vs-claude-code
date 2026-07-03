@@ -873,14 +873,15 @@ export default function (pi: ExtensionAPI) {
     const ctx = currentCtx;
     const ident = identity;
     const pct = ctx ? Math.round(ctx.getContextUsage()?.percent ?? 0) : 0;
+    const effective = recomputeEffective();
     const card: AgentCard = {
       name: ident?.name ?? "unknown",
       purpose: ident?.purpose ?? "",
       model: ctx?.model?.id ?? ident?.model ?? "unknown",
       color: ident?.color ?? "#36F9F6",
       context_used_pct: pct,
-      is_running: agentRunning,
-      is_blocked: agentBlocked || undefined,
+      is_running: effective.running,
+      is_blocked: effective.blocked || undefined,
     };
     const pong: Pong = { type: "pong", msg_id: env.msg_id, agent_card: card };
     try {
@@ -901,17 +902,26 @@ export default function (pi: ExtensionAPI) {
     const sid: string = (msg as any).sender_session;
     if (!sid) return;
     if (msg.closing) {
+      const closingCard = peerCards.get(sid);
+      const wasChild = identity && closingCard
+        ? agentRelationship(identity.name, closingCard.name) === "child"
+        : false;
       peerCards.delete(sid);
       updateSpinnerTimer();
       currentTui?.requestRender?.();
+      if (wasChild) void broadcastStatus(agentRunning);
       return;
     }
     const card = peerCards.get(sid);
+    const isChild = identity && card
+      ? agentRelationship(identity.name, card.name) === "child"
+      : false;
     if (card) {
       card.is_running = msg.is_running;
       card.is_blocked = msg.is_blocked ?? false;
       updateSpinnerTimer();
       currentTui?.requestRender?.();
+      if (isChild) void broadcastStatus(agentRunning);
     } else {
       // Unknown session — new peer or reloaded peer with new session_id.
       // Registry was written before the broadcast; look it up directly.
@@ -930,10 +940,31 @@ export default function (pi: ExtensionAPI) {
           context_used_pct: null,
           staleCount: 0,
         });
+        const newIsChild = identity
+          ? agentRelationship(identity.name, entry.name) === "child"
+          : false;
         updateSpinnerTimer();
         currentTui?.requestRender?.();
+        if (newIsChild) void broadcastStatus(agentRunning);
       }
     }
+  }
+
+  // Compute the effective status this agent should advertise to its parent —
+  // own state bubbled up with the highest-priority child state.
+  // Priority: blocked > running > idle (blocked implies running for display purposes).
+  function recomputeEffective(): { running: boolean; blocked: boolean } {
+    let running = agentRunning;
+    let blocked = agentBlocked;
+    if (identity) {
+      for (const [sid, card] of peerCards.entries()) {
+        if (sid === identity.session_id) continue;
+        if (agentRelationship(identity.name, card.name) !== "child") continue;
+        if (card.is_blocked) blocked = true;
+        if (card.is_running) running = true;
+      }
+    }
+    return { running, blocked };
   }
 
   function broadcastPeerClosed(deadSessionId: string): Promise<void> {
@@ -983,11 +1014,13 @@ export default function (pi: ExtensionAPI) {
   ): Promise<void> {
     if (!identity) return Promise.resolve();
     const entries = readAllDisplayEntries();
+    // Broadcast effective (cascaded) status so the parent sees the subtree state.
+    const effective = closing ? { running: false, blocked: false } : recomputeEffective();
     const payload =
       JSON.stringify({
         type: "status",
-        is_running,
-        is_blocked: agentBlocked || undefined,
+        is_running: effective.running,
+        is_blocked: effective.blocked || undefined,
         closing: closing || undefined,
         sender_session: identity.session_id,
       }) + "\n";
@@ -1605,9 +1638,13 @@ export default function (pi: ExtensionAPI) {
         void broadcastPeerClosed(target.session_id);
       }
       // Drop from our own pool immediately too.
+      const closedIsChild = identity && target
+        ? agentRelationship(identity.name, target.name) === "child"
+        : false;
       peerCards.delete(target?.session_id ?? "");
       updateSpinnerTimer();
       currentTui?.requestRender?.();
+      if (closedIsChild) void broadcastStatus(agentRunning);
     } catch {
       currentCtx?.ui?.notify?.("coms: tmux not available", "error");
     }
