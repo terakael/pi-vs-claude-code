@@ -642,6 +642,14 @@ class ComsNavEditor extends CustomEditor {
       return;
     }
 
+    // When the slash-command/autocomplete dropdown is open, don't intercept
+    // C-n/C-p — the keybindings file already maps them to tui.select.down/up
+    // so they'll navigate the completion list via super.handleInput.
+    if (this.isShowingAutocomplete()) {
+      super.handleInput(data);
+      return;
+    }
+
     const rows = this.getRows();
     const sel = this.getSelected();
 
@@ -778,6 +786,7 @@ export default function (pi: ExtensionAPI) {
   let spinnerFrame = 0;
   let spinnerTimer: NodeJS.Timeout | null = null;
   let currentTui: any = null;
+  let currentEditor: ComsNavEditor | null = null;
 
   // All pools this agent is registered in and reads from.
   // Always includes identity.project (own-name pool); extraProjects adds named pools.
@@ -1317,7 +1326,7 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setWorkingVisible(false);
       ctx.ui.setEditorComponent((tui, theme, kb) => {
         currentTui = tui;
-        return new ComsNavEditor(
+        currentEditor = new ComsNavEditor(
           tui,
           theme,
           kb,
@@ -1348,6 +1357,7 @@ export default function (pi: ExtensionAPI) {
           },
           (line) => ctx.ui.theme.bg("toolPendingBg", line),
         );
+        return currentEditor;
       });
       ctx.ui.setStatus("coms", `📡 ${name}${poolSuffix}`);
     } catch {
@@ -1657,6 +1667,12 @@ export default function (pi: ExtensionAPI) {
 
   // ━━ Pool widget rendering ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   function renderPool(width: number, theme: Theme): string[] {
+    // Hide the pool while autocomplete/slash-command dropdown is open so
+    // there is only one selector on screen at a time.
+    if (currentEditor?.isShowingAutocomplete()) {
+      return [];
+    }
+
     const rows = buildPoolRows();
 
     if (rows.length === 0) {
