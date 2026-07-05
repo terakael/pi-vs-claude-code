@@ -1979,6 +1979,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   function resolveTarget(target: string): RegistryEntry | null {
+    // Tolerate a leading @ — the mention UI and coms_list surface names as
+    // "@name", and models tend to pass that form straight into target.
+    target = target.replace(/^@/, "");
     // Search display pools first (own-name + extra).
     const displayEntries = readAllDisplayEntries();
     const byName = displayEntries.find((e) => e.name === target);
@@ -2071,7 +2074,7 @@ export default function (pi: ExtensionAPI) {
                     ? ` ${a.context_used_pct}%`
                     : " ?%";
                 const live = a.alive ? "●" : "✗";
-                return `${live} ${a.name} (${a.model})${ctxStr}${a.purpose ? ` — ${a.purpose}` : ""}`;
+                return `${live} @${a.name} (${a.model})${ctxStr}${a.purpose ? ` — ${a.purpose}` : ""}`;
               })
               .join("\n");
 
@@ -2109,7 +2112,7 @@ export default function (pi: ExtensionAPI) {
             : theme.fg("error", "✗");
           const pct =
             a.context_used_pct != null ? `${a.context_used_pct}%` : "?%";
-          return `${dot} ${theme.fg("accent", a.name)} ${theme.fg("dim", a.model)} ${theme.fg("warning", pct)}`;
+          return `${dot} ${theme.fg("accent", `@${a.name}`)} ${theme.fg("dim", a.model)} ${theme.fg("warning", pct)}`;
         })
         .join("\n");
       return new Text(header + "\n" + rows, 0, 0);
