@@ -25,8 +25,12 @@ import {
   truncateToWidth,
   visibleWidth,
   wrapTextWithAnsi,
+  fuzzyFilter,
 } from "@mariozechner/pi-tui";
-import type { AutocompleteItem } from "@mariozechner/pi-tui";
+import type {
+  AutocompleteItem,
+  AutocompleteProvider,
+} from "@mariozechner/pi-tui";
 import { spawnSync } from "node:child_process";
 import { Type } from "@sinclair/typebox";
 import * as net from "node:net";
@@ -609,8 +613,15 @@ class ComsNavEditor extends CustomEditor {
     theme: any,
     keybindings: any,
     private getAgentName: () => string,
-    private getStats: () => { model: string | undefined; contextPct: number | null | undefined },
-    private getWorkingState: () => { running: boolean; frame: number; color: string },
+    private getStats: () => {
+      model: string | undefined;
+      contextPct: number | null | undefined;
+    },
+    private getWorkingState: () => {
+      running: boolean;
+      frame: number;
+      color: string;
+    },
     private getRows: () => string[],
     private getSelected: () => number,
     private setSelected: (n: number) => void,
@@ -707,7 +718,7 @@ class ComsNavEditor extends CustomEditor {
       const left = running ? `${d} ${hexFg(color, spinChar)} ` : "";
       const { model, contextPct } = this.getStats();
       const pct = contextPct != null ? `${Math.round(contextPct)}%` : "?%";
-      const right = ` 📡 ${this.getAgentName()} ${d} ${model ?? ""} ${d} ${pct} ${d}`;
+      const right = ` @${this.getAgentName()} ${d} ${model ?? ""} ${d} ${pct} ${d}`;
       const lw = visibleWidth(left);
       const rw = visibleWidth(right);
       const mid = truncateToWidth(lines[last]!, width - lw - rw, "");
@@ -781,7 +792,9 @@ export default function (pi: ExtensionAPI) {
     if (identity) {
       try {
         spawnSync("tmux", ["kill-session", "-t", `${identity.name}-subs`]);
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }
   });
 
@@ -929,9 +942,10 @@ export default function (pi: ExtensionAPI) {
     if (!sid) return;
     if (msg.closing) {
       const closingCard = peerCards.get(sid);
-      const wasChild = identity && closingCard
-        ? agentRelationship(identity.name, closingCard.name) === "child"
-        : false;
+      const wasChild =
+        identity && closingCard
+          ? agentRelationship(identity.name, closingCard.name) === "child"
+          : false;
       peerCards.delete(sid);
       updateSpinnerTimer();
       currentTui?.requestRender?.();
@@ -939,9 +953,10 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     const card = peerCards.get(sid);
-    const isChild = identity && card
-      ? agentRelationship(identity.name, card.name) === "child"
-      : false;
+    const isChild =
+      identity && card
+        ? agentRelationship(identity.name, card.name) === "child"
+        : false;
     if (card) {
       card.is_running = msg.is_running;
       card.is_blocked = msg.is_blocked ?? false;
@@ -1041,7 +1056,9 @@ export default function (pi: ExtensionAPI) {
     if (!identity) return Promise.resolve();
     const entries = readAllDisplayEntries();
     // Broadcast effective (cascaded) status so the parent sees the subtree state.
-    const effective = closing ? { running: false, blocked: false } : recomputeEffective();
+    const effective = closing
+      ? { running: false, blocked: false }
+      : recomputeEffective();
     const payload =
       JSON.stringify({
         type: "status",
@@ -1079,7 +1096,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   function updateSpinnerTimer(): void {
-    const anyRunning = agentRunning || [...peerCards.values()].some((c) => c.is_running);
+    const anyRunning =
+      agentRunning || [...peerCards.values()].some((c) => c.is_running);
     if (anyRunning && !spinnerTimer) {
       spinnerTimer = setInterval(() => {
         spinnerFrame = (spinnerFrame + 1) % SPINNER_FRAMES.length;
@@ -1186,8 +1204,8 @@ export default function (pi: ExtensionAPI) {
             flags.name || fm.name || "",
             flags.name || fm.name || "",
           )
-        : process.env.PI_COMS_NAME  // preserved across /reload — reuse same name
-          ?? pickLevelOneName(liveNames);
+        : (process.env.PI_COMS_NAME ?? // preserved across /reload — reuse same name
+          pickLevelOneName(liveNames));
     const name = defaultName;
     const purpose = flags.purpose || fm.description || "";
 
@@ -1246,7 +1264,7 @@ export default function (pi: ExtensionAPI) {
       }
     } catch (err) {
       ctx.ui?.notify?.(
-        `📡 coms: failed to create dirs — ${err instanceof Error ? err.message : String(err)}`,
+        `coms: failed to create dirs — ${err instanceof Error ? err.message : String(err)}`,
         "error",
       );
       return;
@@ -1257,7 +1275,7 @@ export default function (pi: ExtensionAPI) {
       server = await bindEndpoint(endpoint, connHandler);
     } catch (err) {
       ctx.ui?.notify?.(
-        `📡 coms: bind failed — ${err instanceof Error ? err.message : String(err)}`,
+        `coms: bind failed — ${err instanceof Error ? err.message : String(err)}`,
         "error",
       );
       return;
@@ -1287,7 +1305,7 @@ export default function (pi: ExtensionAPI) {
       registryFiles = poolsToWrite.map((p) => writeRegistryAtomic(entry, p));
     } catch (err) {
       ctx.ui?.notify?.(
-        `📡 coms: registry write failed — ${err instanceof Error ? err.message : String(err)}`,
+        `coms: registry write failed — ${err instanceof Error ? err.message : String(err)}`,
         "error",
       );
       try {
@@ -1335,7 +1353,8 @@ export default function (pi: ExtensionAPI) {
     // 6. Surface presence in the UI + install the live pool widget.
     try {
       const extraPools = extraProjects.filter((p) => p !== name);
-      const poolSuffix = extraPools.length > 0 ? ` [${extraPools.join(", ")}]` : "";
+      const poolSuffix =
+        extraPools.length > 0 ? ` [${extraPools.join(", ")}]` : "";
       installPoolWidget(ctx);
       ctx.ui.setWorkingVisible(false);
       ctx.ui.setEditorComponent((tui, theme, kb) => {
@@ -1348,8 +1367,15 @@ export default function (pi: ExtensionAPI) {
             const extra = extraProjects.filter((p) => p !== identity?.project);
             return extra.length > 0 ? `${name} [${extra.join(", ")}]` : name;
           },
-          () => ({ model: ctx.model?.name, contextPct: ctx.getContextUsage()?.percent }),
-          () => ({ running: agentRunning, frame: spinnerFrame, color: identity?.color ?? "#36F9F6" }),
+          () => ({
+            model: ctx.model?.name,
+            contextPct: ctx.getContextUsage()?.percent,
+          }),
+          () => ({
+            running: agentRunning,
+            frame: spinnerFrame,
+            color: identity?.color ?? "#36F9F6",
+          }),
           () => buildPoolRows().map((r) => r.name),
           () => selectedIndex,
           (n) => {
@@ -1362,7 +1388,7 @@ export default function (pi: ExtensionAPI) {
             if (!identity || !currentCtx?.hasUI) return;
             const extra = extraProjects.filter((p) => p !== identity!.project);
             const suffix = extra.length > 0 ? ` [${extra.join(", ")}]` : "";
-            const base = `📡 ${identity.name}${suffix}`;
+            const base = `@${identity.name}${suffix}`;
             try {
               currentCtx.ui.setStatus("coms", active ? `${base} [C-x]` : base);
             } catch {
@@ -1373,7 +1399,97 @@ export default function (pi: ExtensionAPI) {
         );
         return currentEditor;
       });
-      ctx.ui.setStatus("coms", `📡 ${name}${poolSuffix}`);
+      ctx.ui.setStatus("coms", `@${name}${poolSuffix}`);
+
+      // @-mention completion for peer agents across ALL pools.
+      // Layers on top of the built-in @ file provider: matches @<token>,
+      // merges live agent suggestions with file suggestions under the same prefix.
+      const AT_TOKEN = /(?:^|\s)@([^\s@]*)$/;
+      ctx.ui.addAutocompleteProvider((current: AutocompleteProvider) => ({
+        async getSuggestions(lines, cursorLine, cursorCol, options) {
+          const line = lines[cursorLine] ?? "";
+          const m = line.slice(0, cursorCol).match(AT_TOKEN);
+          if (!m)
+            return current.getSuggestions(
+              lines,
+              cursorLine,
+              cursorCol,
+              options,
+            );
+          const token = m[1] ?? "";
+
+          // All agents across every pool, deduped by session_id, self excluded.
+          const seen = new Set<string>();
+          const uniq: RegistryEntry[] = [];
+          for (const e of readAllRegistryEntriesAcrossProjects()) {
+            if (identity && e.session_id === identity.session_id) continue;
+            if (seen.has(e.session_id)) continue;
+            seen.add(e.session_id);
+            uniq.push(e);
+          }
+          const matched = token
+            ? fuzzyFilter(uniq, token, (e) => `${e.name} ${e.purpose}`)
+            : uniq;
+          const relIcon = (peer: string) =>
+            identity
+              ? { parent: "↑", child: "↓", sibling: "~", peer: " " }[
+                  agentRelationship(identity.name, peer)
+                ]
+              : " ";
+          const home = os.homedir();
+          const prettyPath = (p: string) => {
+            if (!p) return "";
+            const withTilde = p.startsWith(home)
+              ? "~" + p.slice(home.length)
+              : p;
+            const parts = withTilde.split("/").filter(Boolean);
+            // Match tmux status style: keep leading + basename, collapse middle to "...".
+            if (parts.length <= 3) return withTilde;
+            return `${parts[0]}/${parts[1]}/.../${parts[parts.length - 1]}`;
+          };
+          const agentItems: AutocompleteItem[] = matched
+            .slice(0, 20)
+            .map((e) => ({
+              value: `@${e.name}`,
+              label: `@${e.name}`,
+              description: `${relIcon(e.name)} ${prettyPath(e.cwd)}${e.purpose ? ` · ${e.purpose}` : ""}`,
+            }));
+
+          const base = await current.getSuggestions(
+            lines,
+            cursorLine,
+            cursorCol,
+            options,
+          );
+          if (options.signal.aborted) return base;
+          if (base && base.prefix === `@${token}`) {
+            return {
+              prefix: base.prefix,
+              items: [...agentItems, ...base.items],
+            };
+          }
+          if (agentItems.length === 0) return base;
+          return { prefix: `@${token}`, items: agentItems };
+        },
+        applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+          return current.applyCompletion(
+            lines,
+            cursorLine,
+            cursorCol,
+            item,
+            prefix,
+          );
+        },
+        shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
+          return (
+            current.shouldTriggerFileCompletion?.(
+              lines,
+              cursorLine,
+              cursorCol,
+            ) ?? true
+          );
+        },
+      }));
     } catch {
       // hasUI may be false in some contexts — non-fatal.
     }
@@ -1669,9 +1785,10 @@ export default function (pi: ExtensionAPI) {
         void broadcastPeerClosed(target.session_id);
       }
       // Drop from our own pool immediately too.
-      const closedIsChild = identity && target
-        ? agentRelationship(identity.name, target.name) === "child"
-        : false;
+      const closedIsChild =
+        identity && target
+          ? agentRelationship(identity.name, target.name) === "child"
+          : false;
       peerCards.delete(target?.session_id ?? "");
       updateSpinnerTimer();
       currentTui?.requestRender?.();
@@ -1709,7 +1826,10 @@ export default function (pi: ExtensionAPI) {
 
       if (r.stale) {
         const dimRow = `✗ ${relIcon}${r.name.padEnd(11)} ${abbreviateModel(r.model).padEnd(16)}  ${pctLabel.padStart(4)}  —  ${r.purpose || ""}`;
-        const truncated = truncateToWidth((isSelected ? "❯ " : "  ") + theme.fg("dim", dimRow), width);
+        const truncated = truncateToWidth(
+          (isSelected ? "❯ " : "  ") + theme.fg("dim", dimRow),
+          width,
+        );
         out.push(isSelected ? theme.bold(truncated) : truncated);
         continue;
       }
@@ -1978,7 +2098,7 @@ export default function (pi: ExtensionAPI) {
     renderResult(result, options, theme) {
       const details = result.details as any;
       const agents: any[] = details?.agents ?? [];
-      const header = theme.fg("accent", `📡 ${agents.length} peer(s)`);
+      const header = theme.fg("accent", `${agents.length} peer(s)`);
       if (!options.expanded || agents.length === 0) {
         return new Text(header, 0, 0);
       }
@@ -2125,7 +2245,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (_event, ctx) => {
     if (!identity || !ctx.hasUI) return;
-    try { ctx.ui.setWorkingVisible(false); } catch { /* ignore */ }
+    try {
+      ctx.ui.setWorkingVisible(false);
+    } catch {
+      /* ignore */
+    }
   });
 
   pi.on("agent_end", async () => {
@@ -2187,7 +2311,7 @@ export default function (pi: ExtensionAPI) {
         try {
           const extra = extraProjects.filter((p) => p !== identity?.project);
           const suffix = extra.length > 0 ? ` [${extra.join(", ")}]` : "";
-          ctx.ui.setStatus("coms", `📡 ${identity?.name ?? ""}${suffix}`);
+          ctx.ui.setStatus("coms", `@${identity?.name ?? ""}${suffix}`);
           ctx.ui.notify(
             `coms: joined project ${p} · pools: ${allProjects().join(", ")}`,
             "info",
@@ -2210,7 +2334,9 @@ export default function (pi: ExtensionAPI) {
     if (identity) {
       try {
         spawnSync("tmux", ["kill-session", "-t", `${identity.name}-subs`]);
-      } catch { /* no subs session — ignore */ }
+      } catch {
+        /* no subs session — ignore */
+      }
     }
     await broadcastStatus(false, true);
     if (pingTimer) {
