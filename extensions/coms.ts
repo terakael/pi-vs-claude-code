@@ -16,7 +16,11 @@ import type {
   ExtensionContext,
   Theme,
 } from "@mariozechner/pi-coding-agent";
-import { CustomEditor, DynamicBorder } from "@mariozechner/pi-coding-agent";
+import {
+  getEditorHost,
+  installEditorHost,
+  uninstallEditorHost,
+} from "./editor-host.ts";
 import {
   Key,
   Text,
@@ -603,132 +607,6 @@ function readFrontmatterFromArgv(argv: string[]): {
   }
 }
 
-// ━━ Keyboard-navigable pool (CustomEditor subclass) ━━━━━━━━━━━━━━━━━━━━━━━━━
-
-class ComsNavEditor extends CustomEditor {
-  private leaderActive = false;
-
-  constructor(
-    private _tui: any,
-    theme: any,
-    keybindings: any,
-    private getAgentName: () => string,
-    private getStats: () => {
-      model: string | undefined;
-      contextPct: number | null | undefined;
-    },
-    private getWorkingState: () => {
-      running: boolean;
-      frame: number;
-      color: string;
-    },
-    private getRows: () => string[],
-    private getSelected: () => number,
-    private setSelected: (n: number) => void,
-    private onNavigate: (name: string) => void,
-    private onClose: (name: string) => void,
-    private leaderBindings: ReadonlyMap<string, () => void>,
-    private onLeaderChange: (active: boolean) => void,
-    private styleLeaderLine: (line: string) => string,
-  ) {
-    super(_tui, theme, keybindings);
-  }
-
-  override handleInput(data: string): void {
-    // Leader mode: consume next key and dispatch.
-    if (this.leaderActive) {
-      this.leaderActive = false;
-      this.onLeaderChange(false);
-      if (!matchesKey(data, Key.escape)) {
-        this.leaderBindings.get(data)?.();
-      }
-      this._tui.requestRender();
-      return;
-    }
-
-    if (matchesKey(data, Key.ctrl("x"))) {
-      this.leaderActive = true;
-      this.onLeaderChange(true);
-      this._tui.requestRender();
-      return;
-    }
-
-    // When the slash-command/autocomplete dropdown is open, don't intercept
-    // C-n/C-p — the keybindings file already maps them to tui.select.down/up
-    // so they'll navigate the completion list via super.handleInput.
-    if (this.isShowingAutocomplete()) {
-      super.handleInput(data);
-      return;
-    }
-
-    const rows = this.getRows();
-    const sel = this.getSelected();
-
-    if (matchesKey(data, Key.ctrl("n"))) {
-      if (rows.length > 0) {
-        this.setSelected(sel >= rows.length - 1 ? -1 : sel + 1);
-        this._tui.requestRender();
-      }
-      return;
-    }
-
-    if (matchesKey(data, Key.ctrl("p"))) {
-      if (rows.length > 0) {
-        this.setSelected(sel === -1 ? rows.length - 1 : sel - 1);
-        this._tui.requestRender();
-      }
-      return;
-    }
-
-    if (matchesKey(data, Key.enter) && sel >= 0) {
-      const name = rows[sel];
-      if (name) this.onNavigate(name);
-      this.setSelected(-1);
-      this._tui.requestRender();
-      return;
-    }
-
-    if (matchesKey(data, Key.escape) && sel >= 0) {
-      this.setSelected(-1);
-      this._tui.requestRender();
-      return;
-    }
-
-    if (data === "x" && sel >= 0) {
-      const name = rows[sel];
-      if (name) this.onClose(name);
-      this.setSelected(-1);
-      this._tui.requestRender();
-      return;
-    }
-
-    super.handleInput(data);
-  }
-
-  override render(width: number): string[] {
-    const lines = super.render(width);
-    if (lines.length > 0) {
-      const last = lines.length - 1;
-      const borderLine = lines[last]!;
-      const dashIdx = borderLine.indexOf("─");
-      const borderStyle = dashIdx > 0 ? borderLine.slice(0, dashIdx) : "";
-      const d = borderStyle ? `${borderStyle}─\x1b[0m` : "─";
-      const { running, frame, color } = this.getWorkingState();
-      const spinChar = SPINNER_FRAMES[frame % SPINNER_FRAMES.length]!;
-      const left = running ? `${d} ${hexFg(color, spinChar)} ` : "";
-      const { model, contextPct } = this.getStats();
-      const pct = contextPct != null ? `${Math.round(contextPct)}%` : "?%";
-      const right = ` @${this.getAgentName()} ${d} ${model ?? ""} ${d} ${pct} ${d}`;
-      const lw = visibleWidth(left);
-      const rw = visibleWidth(right);
-      const mid = truncateToWidth(lines[last]!, width - lw - rw, "");
-      lines[last] = left + mid + right;
-    }
-    if (!this.leaderActive) return lines;
-    return lines.map((line) => this.styleLeaderLine(line));
-  }
-}
-
 // ━━ Default export ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 export default function (pi: ExtensionAPI) {
@@ -812,8 +690,8 @@ export default function (pi: ExtensionAPI) {
   let agentBlocked = false;
   let spinnerFrame = 0;
   let spinnerTimer: NodeJS.Timeout | null = null;
-  let currentTui: any = null;
-  let currentEditor: ComsNavEditor | null = null;
+  const host = getEditorHost();
+  let leaderActive = false;
 
   // All pools this agent is registered in and reads from.
   // Always includes identity.project (own-name pool); extraProjects adds named pools.
@@ -948,7 +826,7 @@ export default function (pi: ExtensionAPI) {
           : false;
       peerCards.delete(sid);
       updateSpinnerTimer();
-      currentTui?.requestRender?.();
+      host.requestRender();
       if (wasChild) void broadcastStatus(agentRunning);
       return;
     }
@@ -961,7 +839,7 @@ export default function (pi: ExtensionAPI) {
       card.is_running = msg.is_running;
       card.is_blocked = msg.is_blocked ?? false;
       updateSpinnerTimer();
-      currentTui?.requestRender?.();
+      host.requestRender();
       if (isChild) void broadcastStatus(agentRunning);
     } else {
       // Unknown session — new peer or reloaded peer with new session_id.
@@ -985,7 +863,7 @@ export default function (pi: ExtensionAPI) {
           ? agentRelationship(identity.name, entry.name) === "child"
           : false;
         updateSpinnerTimer();
-        currentTui?.requestRender?.();
+        host.requestRender();
         if (newIsChild) void broadcastStatus(agentRunning);
       }
     }
@@ -1101,7 +979,7 @@ export default function (pi: ExtensionAPI) {
     if (anyRunning && !spinnerTimer) {
       spinnerTimer = setInterval(() => {
         spinnerFrame = (spinnerFrame + 1) % SPINNER_FRAMES.length;
-        currentTui?.requestRender?.();
+        host.requestRender();
       }, 100);
       try {
         (spinnerTimer as any).unref?.();
@@ -1357,48 +1235,127 @@ export default function (pi: ExtensionAPI) {
         extraPools.length > 0 ? ` [${extraPools.join(", ")}]` : "";
       installPoolWidget(ctx);
       ctx.ui.setWorkingVisible(false);
-      ctx.ui.setEditorComponent((tui, theme, kb) => {
-        currentTui = tui;
-        currentEditor = new ComsNavEditor(
-          tui,
-          theme,
-          kb,
-          () => {
-            const extra = extraProjects.filter((p) => p !== identity?.project);
-            return extra.length > 0 ? `${name} [${extra.join(", ")}]` : name;
-          },
-          () => ({
-            model: ctx.model?.name,
-            contextPct: ctx.getContextUsage()?.percent,
-          }),
-          () => ({
-            running: agentRunning,
-            frame: spinnerFrame,
-            color: identity?.color ?? "#36F9F6",
-          }),
-          () => buildPoolRows().map((r) => r.name),
-          () => selectedIndex,
-          (n) => {
-            selectedIndex = n;
-          },
-          navigateToAgent,
-          closeAgent,
-          new Map([["h", toggleWidget]]),
-          (active) => {
-            if (!identity || !currentCtx?.hasUI) return;
-            const extra = extraProjects.filter((p) => p !== identity!.project);
-            const suffix = extra.length > 0 ? ` [${extra.join(", ")}]` : "";
-            const base = `@${identity.name}${suffix}`;
-            try {
-              currentCtx.ui.setStatus("coms", active ? `${base} [C-x]` : base);
-            } catch {
-              /* ignore */
-            }
-          },
-          (line) => ctx.ui.theme.bg("toolPendingBg", line),
-        );
-        return currentEditor;
+      installEditorHost(ctx);
+      host.unregisterOwner("coms"); // idempotent if session_start re-runs
+
+      const agentLabel = () => {
+        const extra = extraProjects.filter((p) => p !== identity?.project);
+        return extra.length > 0 ? `${name} [${extra.join(", ")}]` : name;
+      };
+      const setLeaderStatus = (active: boolean) => {
+        if (!identity || !currentCtx?.hasUI) return;
+        const extra = extraProjects.filter((p) => p !== identity!.project);
+        const suffix = extra.length > 0 ? ` [${extra.join(", ")}]` : "";
+        const base = `@${identity.name}${suffix}`;
+        try {
+          currentCtx.ui.setStatus("coms", active ? `${base} [C-x]` : base);
+        } catch {
+          /* ignore */
+        }
+      };
+      const leaderBindings = new Map<string, () => void>([["h", toggleWidget]]);
+
+      // Bottom-left: working spinner. Bottom-right: @name ─ model ─ ctx%.
+      host.registerSegment({
+        owner: "coms",
+        zone: "bottom_left",
+        get: () =>
+          agentRunning
+            ? hexFg(
+                identity?.color ?? "#36F9F6",
+                SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length]!,
+              )
+            : null,
       });
+      host.registerSegment({
+        owner: "coms",
+        zone: "bottom_right",
+        order: 0,
+        get: () => `@${agentLabel()}`,
+      });
+      host.registerSegment({
+        owner: "coms",
+        zone: "bottom_right",
+        order: 1,
+        get: () => ctx.model?.name ?? null,
+      });
+      host.registerSegment({
+        owner: "coms",
+        zone: "bottom_right",
+        order: 2,
+        get: () => {
+          const p = ctx.getContextUsage()?.percent;
+          return p != null ? `${Math.round(p)}%` : "?%";
+        },
+      });
+
+      // Dim the whole editor while the C-x leader is armed.
+      host.registerDecorator({
+        owner: "coms",
+        decorate: (lines) =>
+          leaderActive
+            ? lines.map((l) => ctx.ui.theme.bg("toolPendingBg", l))
+            : lines,
+      });
+
+      // Pool navigation + C-x leader, replicated from the old ComsNavEditor.
+      host.registerKeyHandler({
+        owner: "coms",
+        handle: (data, api) => {
+          if (leaderActive) {
+            leaderActive = false;
+            setLeaderStatus(false);
+            if (!matchesKey(data, Key.escape)) leaderBindings.get(data)?.();
+            host.requestRender();
+            return true;
+          }
+          if (matchesKey(data, Key.ctrl("x"))) {
+            leaderActive = true;
+            setLeaderStatus(true);
+            host.requestRender();
+            return true;
+          }
+          // Let the autocomplete dropdown own C-n/C-p/enter/esc while open.
+          if (api.isShowingAutocomplete()) return false;
+          const rows = buildPoolRows().map((r) => r.name);
+          const sel = selectedIndex;
+          if (matchesKey(data, Key.ctrl("n"))) {
+            if (rows.length > 0) {
+              selectedIndex = sel >= rows.length - 1 ? -1 : sel + 1;
+              host.requestRender();
+            }
+            return true;
+          }
+          if (matchesKey(data, Key.ctrl("p"))) {
+            if (rows.length > 0) {
+              selectedIndex = sel === -1 ? rows.length - 1 : sel - 1;
+              host.requestRender();
+            }
+            return true;
+          }
+          if (matchesKey(data, Key.enter) && sel >= 0) {
+            const n = rows[sel];
+            if (n) navigateToAgent(n);
+            selectedIndex = -1;
+            host.requestRender();
+            return true;
+          }
+          if (matchesKey(data, Key.escape) && sel >= 0) {
+            selectedIndex = -1;
+            host.requestRender();
+            return true;
+          }
+          if (data === "x" && sel >= 0) {
+            const n = rows[sel];
+            if (n) closeAgent(n);
+            selectedIndex = -1;
+            host.requestRender();
+            return true;
+          }
+          return false;
+        },
+      });
+
       ctx.ui.setStatus("coms", `@${name}${poolSuffix}`);
 
       // @-mention completion for peer agents across ALL pools.
@@ -1791,7 +1748,7 @@ export default function (pi: ExtensionAPI) {
           : false;
       peerCards.delete(target?.session_id ?? "");
       updateSpinnerTimer();
-      currentTui?.requestRender?.();
+      host.requestRender();
       if (closedIsChild) void broadcastStatus(agentRunning);
     } catch {
       currentCtx?.ui?.notify?.("coms: tmux not available", "error");
@@ -1802,7 +1759,7 @@ export default function (pi: ExtensionAPI) {
   function renderPool(width: number, theme: Theme): string[] {
     // Hide the pool while autocomplete/slash-command dropdown is open so
     // there is only one selector on screen at a time.
-    if (currentEditor?.isShowingAutocomplete()) {
+    if (host.isShowingAutocomplete()) {
       return [];
     }
 
@@ -2409,7 +2366,8 @@ export default function (pi: ExtensionAPI) {
         /* ignore */
       }
       try {
-        currentCtx.ui.setEditorComponent(undefined);
+        host.unregisterOwner("coms");
+        uninstallEditorHost(currentCtx);
       } catch {
         /* ignore */
       }
@@ -2418,7 +2376,6 @@ export default function (pi: ExtensionAPI) {
       } catch {
         /* ignore */
       }
-      currentTui = null;
     }
     selectedIndex = -1;
   }
