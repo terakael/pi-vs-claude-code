@@ -97,8 +97,8 @@ interface PingEnvelope extends Envelope {
 
 interface TreePingEnvelope extends Envelope {
   type: "tree_ping";
-  request_id: string;  // shared across one full cascade cycle
-  max_depth: number;   // remaining depth budget (decrements each hop)
+  request_id: string; // shared across one full cascade cycle
+  max_depth: number; // remaining depth budget (decrements each hop)
 }
 
 interface TreePongNode {
@@ -118,6 +118,7 @@ interface TreePong {
 interface TreeAnnounce {
   type: "tree_announce";
   sender_session: string;
+  sender_parent_session?: string; // sender's parent session_id — lets receivers compute sibling relationship
   node: TreePongNode;
 }
 
@@ -714,6 +715,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   const peerCards: Map<string, AgentCard & { staleCount: number }> = new Map();
+  // Session ID of our parent agent — set on first incoming tree_ping.
+  // null for root agents (no parent).
+  let myParentSessionId: string | null = null;
   let server: net.Server | null = null;
   let pingTimer: NodeJS.Timeout | null = null;
   let keepaliveTimer: NodeJS.Timeout | null = null;
@@ -882,12 +886,22 @@ export default function (pi: ExtensionAPI) {
         const closingSenderIsMyDirectChild =
           identity && closingSenderCard
             ? closingSenderCard.name.startsWith(identity.name + "-") &&
-              !closingSenderCard.name.slice(identity.name.length + 1).includes("-")
+              !closingSenderCard.name
+                .slice(identity.name.length + 1)
+                .includes("-")
             : false;
         if (closingSenderIsMyDirectChild) {
           const cardForRelay = originCard ?? closingCard;
           if (cardForRelay) {
-            void relayCardEvent(senderSid, originSid, cardForRelay, false, undefined, true, relayDepth);
+            void relayCardEvent(
+              senderSid,
+              originSid,
+              cardForRelay,
+              false,
+              undefined,
+              true,
+              relayDepth,
+            );
           }
         }
       }
@@ -898,19 +912,28 @@ export default function (pi: ExtensionAPI) {
 
     // Determine card data. Prefer fresh origin_card from the broadcast;
     // fall back to existing card; for direct (non-relayed) peers look up registry.
-    let cardData: (AgentCard & { session_id?: string; cwd?: string; endpoint?: string }) | null = null;
+    let cardData:
+      | (AgentCard & { session_id?: string; cwd?: string; endpoint?: string })
+      | null = null;
     if (originCard) {
       cardData = originCard;
     } else if (existing) {
       cardData = existing as any;
     } else if (originSid === senderSid) {
       // Direct peer — look up from registry.
-      const entry = readAllDisplayEntries().find((e) => e.session_id === originSid);
+      const entry = readAllDisplayEntries().find(
+        (e) => e.session_id === originSid,
+      );
       if (entry) {
         cardData = {
-          name: entry.name, purpose: entry.purpose, model: entry.model,
-          color: entry.color, context_used_pct: null,
-          session_id: entry.session_id, cwd: entry.cwd, endpoint: entry.endpoint,
+          name: entry.name,
+          purpose: entry.purpose,
+          model: entry.model,
+          color: entry.color,
+          context_used_pct: null,
+          session_id: entry.session_id,
+          cwd: entry.cwd,
+          endpoint: entry.endpoint,
         };
       }
     }
@@ -930,7 +953,8 @@ export default function (pi: ExtensionAPI) {
         existing.model = originCard.model ?? existing.model;
         existing.color = originCard.color ?? existing.color;
         existing.purpose = originCard.purpose ?? existing.purpose;
-        existing.context_used_pct = originCard.context_used_pct ?? existing.context_used_pct;
+        existing.context_used_pct =
+          originCard.context_used_pct ?? existing.context_used_pct;
       }
       existing.is_running = msg.is_running;
       existing.is_blocked = msg.is_blocked ?? false;
@@ -978,7 +1002,15 @@ export default function (pi: ExtensionAPI) {
         is_running: msg.is_running,
         is_blocked: msg.is_blocked,
       };
-      void relayCardEvent(senderSid, originSid, relayCard, msg.is_running, msg.is_blocked, false, relayDepth);
+      void relayCardEvent(
+        senderSid,
+        originSid,
+        relayCard,
+        msg.is_running,
+        msg.is_blocked,
+        false,
+        relayDepth,
+      );
     }
   }
 
@@ -1028,8 +1060,8 @@ export default function (pi: ExtensionAPI) {
       .filter(
         (e) =>
           e.session_id !== identity!.session_id &&
-          e.session_id !== originSid &&   // don't echo back to origin
-          e.session_id !== senderSid &&   // don't echo back to who told us
+          e.session_id !== originSid && // don't echo back to origin
+          e.session_id !== senderSid && // don't echo back to who told us
           // Only relay to parent and siblings — never downstream to our own children.
           // The first-hop broadcast (from the origin's direct parent) already covered them.
           agentRelationship(identity!.name, e.name) !== "child",
@@ -1041,7 +1073,12 @@ export default function (pi: ExtensionAPI) {
               const sock = net.createConnection(entry.endpoint);
               const done = () => resolve();
               sock.once("connect", () => {
-                try { sock.write(payload); sock.end(); } catch { /* ignore */ }
+                try {
+                  sock.write(payload);
+                  sock.end();
+                } catch {
+                  /* ignore */
+                }
               });
               sock.once("close", done);
               sock.once("error", done);
@@ -1756,9 +1793,16 @@ export default function (pi: ExtensionAPI) {
     env: TreePingEnvelope,
   ): Promise<void> {
     if (!identity) {
-      try { socket.end(); } catch { /* ignore */ }
+      try {
+        socket.end();
+      } catch {
+        /* ignore */
+      }
       return;
     }
+
+    // Record our parent session on the first tree_ping we receive.
+    if (!myParentSessionId) myParentSessionId = env.sender_session;
 
     const childNodes: TreePongNode[] = [];
 
@@ -1817,15 +1861,22 @@ export default function (pi: ExtensionAPI) {
     };
     try {
       socket.write(JSON.stringify(pong) + "\n");
-    } catch { /* ignore */ }
-    try { socket.end(); } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
+    try {
+      socket.end();
+    } catch {
+      /* ignore */
+    }
   }
 
   /**
    * Recursively applies a TreePongNode subtree to peerCards.
-   * Sets lastSeenAt on every card touched so cleanupStaleCards can evict by TTL.
+   * parentSid is the session_id of the node's parent — stored on the card so
+   * buildPoolRows can derive relationships without name parsing.
    */
-  function applyTreePongNode(node: TreePongNode): void {
+  function applyTreePongNode(node: TreePongNode, parentSid?: string): void {
     if (!identity || node.session_id === identity.session_id) return;
     const now = Date.now();
     const existing = peerCards.get(node.session_id);
@@ -1833,6 +1884,8 @@ export default function (pi: ExtensionAPI) {
       // Refresh in place.
       Object.assign(existing, node.card);
       (existing as any).lastSeenAt = now;
+      (existing as any).parentSessionId =
+        parentSid ?? (existing as any).parentSessionId;
       existing.staleCount = 0;
     } else {
       peerCards.set(node.session_id, {
@@ -1840,12 +1893,13 @@ export default function (pi: ExtensionAPI) {
         session_id: node.session_id,
         staleCount: 0,
         lastSeenAt: now,
+        parentSessionId: parentSid,
       } as any);
     }
     updateSpinnerTimer();
     host.requestRender();
     for (const child of node.children) {
-      applyTreePongNode(child);
+      applyTreePongNode(child, node.session_id);
     }
   }
 
@@ -1858,29 +1912,51 @@ export default function (pi: ExtensionAPI) {
     const entries = readAllDisplayEntries().filter(
       (e) => e.session_id !== identity!.session_id,
     );
-    const payload = JSON.stringify({
-      type: "tree_announce",
-      sender_session: identity.session_id,
-      node,
-    } satisfies TreeAnnounce) + "\n";
+    const payload =
+      JSON.stringify({
+        type: "tree_announce",
+        sender_session: identity.session_id,
+        sender_parent_session: myParentSessionId ?? undefined,
+        node,
+      } satisfies TreeAnnounce) + "\n";
     for (const entry of entries) {
       try {
         const sock = net.createConnection({ path: entry.endpoint });
         sock.once("connect", () => {
-          try { sock.write(payload); sock.end(); } catch { /* ignore */ }
+          try {
+            sock.write(payload);
+            sock.end();
+          } catch {
+            /* ignore */
+          }
         });
-        sock.once("error", () => { try { sock.destroy(); } catch { /* ignore */ } });
-        setTimeout(() => { try { sock.destroy(); } catch { /* ignore */ } }, 1000);
-      } catch { /* ignore */ }
+        sock.once("error", () => {
+          try {
+            sock.destroy();
+          } catch {
+            /* ignore */
+          }
+        });
+        setTimeout(() => {
+          try {
+            sock.destroy();
+          } catch {
+            /* ignore */
+          }
+        }, 1000);
+      } catch {
+        /* ignore */
+      }
     }
   }
 
-  /** Handle an incoming tree_announce from a peer: apply their subtree to peerCards. */
   function handleTreeAnnounce(msg: TreeAnnounce): void {
     if (!identity) return;
     if (msg.sender_session === identity.session_id) return;
     if (!msg.node) return;
-    applyTreePongNode(msg.node);
+    // Pass the sender's parent session so the announcer's own card gets the correct
+    // parentSessionId, enabling sibling relationship detection in buildPoolRows.
+    applyTreePongNode(msg.node, msg.sender_parent_session);
     if (currentCtx?.hasUI) installPoolWidget(currentCtx);
   }
 
@@ -1949,9 +2025,8 @@ export default function (pi: ExtensionAPI) {
 
     for (const r of results) {
       if (r.status === "fulfilled" && r.value.resp?.type === "tree_pong") {
-        // Apply child's subtree so root's widget is populated immediately
-        // without waiting for tree_announces to arrive.
-        applyTreePongNode((r.value.resp as TreePong).node);
+        // Pass identity.session_id as parent — these nodes are our direct children.
+        applyTreePongNode((r.value.resp as TreePong).node, identity.session_id);
       }
       // Absent children are handled by cleanupStaleCards (TTL-based eviction).
     }
@@ -2028,14 +2103,51 @@ export default function (pi: ExtensionAPI) {
     const rows: PoolRow[] = [];
     const seenSessions = new Set<string>();
 
-    const myName = identity?.name ?? "";
-    // Depth = how many name segments the peer has beyond my own level.
-    // Examples from grave-cord's view: grave-ash → 0, grave-ash-cairn → 1, grave → 0 (parent clamped)
-    const mySegments = myName ? myName.split("-").length : 0;
-    const nameDepth = (peerName: string): number => {
-      if (!myName) return 0;
-      return Math.max(0, peerName.split("-").length - mySegments);
+    const mySid = identity?.session_id ?? "";
+
+    // Build a parent-pointer map from stored cards.
+    // parentOf.get(sid) = that agent's parent's session_id.
+    const parentOf = new Map<string, string>();
+    for (const [sid, card] of peerCards.entries()) {
+      const p = (card as any).parentSessionId as string | undefined;
+      if (p) parentOf.set(sid, p);
+    }
+    // Include ourselves so treeDepth can walk up through us.
+    if (myParentSessionId && mySid) parentOf.set(mySid, myParentSessionId);
+
+    // Count hops from a session to the root of the known tree.
+    const treeDepth = (sid: string): number => {
+      let d = 0,
+        cur = sid;
+      const visited = new Set<string>();
+      while (true) {
+        const p = parentOf.get(cur);
+        if (!p || visited.has(p)) break;
+        visited.add(cur);
+        cur = p;
+        d++;
+        if (d > 20) break;
+      }
+      return d;
     };
+
+    const myDepth = treeDepth(mySid);
+
+    // Relationship from our perspective, using stored parent pointers.
+    const sessionRelationship = (
+      sid: string,
+    ): "parent" | "child" | "sibling" | "peer" => {
+      if (sid === myParentSessionId) return "parent";
+      if (parentOf.get(sid) === mySid) return "child";
+      if (myParentSessionId && parentOf.get(sid) === myParentSessionId)
+        return "sibling";
+      return "peer";
+    };
+
+    // Visual depth: how many levels below my horizontal this card sits.
+    // My children = 1, siblings' children = 1, grandchildren = 2, etc.
+    const visualDepth = (sid: string): number =>
+      Math.max(0, treeDepth(sid) - myDepth);
 
     for (const [sid, card] of peerCards.entries()) {
       if (identity && sid === identity.session_id) continue;
@@ -2052,10 +2164,8 @@ export default function (pi: ExtensionAPI) {
           : (card.staleCount ?? 0) >= 3,
         running: card.is_running ?? false,
         blocked: card.is_blocked ?? false,
-        relationship: identity
-          ? agentRelationship(identity.name, card.name)
-          : "peer",
-        depth: nameDepth(card.name),
+        relationship: sessionRelationship(sid),
+        depth: visualDepth(sid),
       });
     }
 
@@ -2075,10 +2185,8 @@ export default function (pi: ExtensionAPI) {
         stale: false,
         running: false,
         blocked: false,
-        relationship: identity
-          ? agentRelationship(identity.name, entry.name)
-          : "peer",
-        depth: nameDepth(entry.name),
+        relationship: sessionRelationship(entry.session_id),
+        depth: visualDepth(entry.session_id),
       });
     }
 
@@ -2234,11 +2342,17 @@ export default function (pi: ExtensionAPI) {
       //   depth > 1: any deeply nested agent (grandchild+ from root's view)
       //   depth === 1 AND relationship !== "child": sibling's child visible from non-root
       // Use relationship icon otherwise (depth 0, or depth 1 direct own child → ↓).
-      const useRelIcon = r.depth === 0 || (r.depth === 1 && r.relationship === "child");
+      const useRelIcon =
+        r.depth === 0 || (r.depth === 1 && r.relationship === "child");
       const indent = useRelIcon ? "" : "  ".repeat(Math.max(1, r.depth - 1));
       const relIcon = useRelIcon
-        ? theme.fg("dim", { parent: "↑", child: "↓", sibling: "~", peer: " " }[r.relationship] ?? " ")
-        : theme.fg("dim", "└ ");
+        ? theme.fg(
+            "dim",
+            { parent: "↑", child: "↓", sibling: "~", peer: " " }[
+              r.relationship
+            ] ?? " ",
+          )
+        : theme.fg("dim", "└");
 
       if (r.stale) {
         const dimRow = `✗ ${indent}${r.name.padEnd(11)} ${abbreviateModel(r.model).padEnd(16)}  ${pctLabel.padStart(4)}  —  ${r.purpose || ""}`;
