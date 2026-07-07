@@ -13,11 +13,103 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import * as fs from "fs";
+import * as net from "node:net";
+import * as crypto from "node:crypto";
 import * as os from "os";
 import * as path from "path";
 import { pickSubagentName } from "./naming.ts";
 
 const { execFile } = require("child_process") as typeof import("child_process");
+
+// ── Coms socket injection ────────────────────────────────────────────────────
+
+// Sends the initial task to a freshly-spawned subagent via its coms unix socket
+// rather than tmux send-keys. Works for both tmux and headless backends because
+// coms.ts binds the socket *before* writing the registry file, so registry
+// presence guarantees the socket is ready.
+async function sendInitialTaskViaComs(
+  comsName: string,
+  comsProject: string,
+  task: string,
+  parentName: string,
+): Promise<void> {
+  const comsDir =
+    process.env.PI_COMS_DIR || path.join(os.homedir(), ".pi", "coms");
+
+  // Read subagent registry to get its socket endpoint.
+  const subRegistryFile = path.join(
+    comsDir, "projects", comsProject, "agents", `${comsName}.json`,
+  );
+  const subEntry = JSON.parse(fs.readFileSync(subRegistryFile, "utf-8"));
+  const endpoint = subEntry.endpoint as string;
+
+  // Best-effort: read parent's own registry for proper sender identity.
+  let senderSession = crypto.randomBytes(8).toString("hex");
+  let senderEndpoint = "";
+  try {
+    const parentRegistryFile = path.join(
+      comsDir, "projects", parentName, "agents", `${parentName}.json`,
+    );
+    const parentEntry = JSON.parse(fs.readFileSync(parentRegistryFile, "utf-8"));
+    senderSession = parentEntry.session_id;
+    senderEndpoint = parentEntry.endpoint;
+  } catch { /* use generated fallbacks */ }
+
+  const envelope = {
+    type: "prompt",
+    msg_id: crypto.randomBytes(10).toString("hex"),
+    sender_session: senderSession,
+    sender_endpoint: senderEndpoint,
+    sender_name: parentName,
+    sender_cwd: process.cwd(),
+    hops: 0,
+    timestamp: new Date().toISOString(),
+    prompt: task,
+    conversation_id: null,
+  };
+
+  await new Promise<void>((resolve, reject) => {
+    const sock = net.createConnection({ path: endpoint });
+    let settled = false;
+    let buf = "";
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      try { sock.destroy(); } catch { /* ignore */ }
+      reject(err);
+    };
+    const timer = setTimeout(() => fail(new Error("coms inject timeout")), 5_000);
+    sock.once("error", fail);
+    sock.once("connect", () => {
+      try {
+        sock.write(JSON.stringify(envelope) + "\n");
+      } catch (err) {
+        clearTimeout(timer);
+        fail(err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
+      sock.on("data", (chunk: Buffer) => {
+        buf += chunk.toString("utf-8");
+        const nl = buf.indexOf("\n");
+        if (nl < 0) return;
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { sock.end(); } catch { /* ignore */ }
+        try {
+          const resp = JSON.parse(buf.slice(0, nl));
+          if (resp.type === "nack") reject(new Error(resp.error || "nack"));
+          else resolve();
+        } catch {
+          reject(new Error("malformed response from coms socket"));
+        }
+      });
+      sock.once("close", () => {
+        if (!settled) fail(new Error("connection closed before ack"));
+      });
+    });
+  });
+}
 
 // ── Tmux helpers ──────────────────────────────────────────────────────────────
 
@@ -165,6 +257,7 @@ export default function (pi: ExtensionAPI) {
   let nextId = 1;
   let agentDefs: AgentDef[] = [];
   let agentsTable = "";
+  let scopedModelsNote = "";
 
   function makeSessionFile(id: number): string {
     const dir = path.join(
@@ -291,17 +384,12 @@ export default function (pi: ExtensionAPI) {
       );
     }
 
-    await waitForComsRegistry(comsName, comsProject);
+    const ready = await waitForComsRegistry(comsName, comsProject);
+    if (!ready) throw new Error(`subagent ${comsName} did not initialise within timeout`);
     const taskWithReporting =
       task +
       `\n\nIMPORTANT: When you have completed this task, you MUST send your result back to the parent agent using the coms_send tool with target="${parentName}". Do not skip this — it is required even for simple or short tasks. Do not just reply in chat.`;
-    await tmux(
-      "send-keys",
-      "-t",
-      `${subsSession}:${tmuxWindow}`,
-      taskWithReporting,
-      "Enter",
-    );
+    await sendInitialTaskViaComs(comsName, comsProject, taskWithReporting, parentName);
 
     const state: SubState = {
       id,
@@ -417,6 +505,17 @@ export default function (pi: ExtensionAPI) {
     agentDefs = [...localDefs, ...globalDefs.filter((d) => !seen.has(d.name))];
     agentsTable = buildAgentsTable(agentDefs);
 
+    // Read scoped/enabled models from settings.json for subagent spawning guidance
+    try {
+      const settingsPath = path.join(os.homedir(), ".pi", "agent", "settings.json");
+      const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+      const enabledModels: string[] = settings.enabledModels ?? [];
+      if (enabledModels.length > 0) {
+        const list = enabledModels.map((m: string) => `- ${m}`).join("\n");
+        scopedModelsNote = `\n\n## Available Models for Subagents\nWhen spawning subagents and no agent profile specifies a model, choose only from this list:\n${list}`;
+      }
+    } catch { /* settings.json missing or malformed */ }
+
     // If we were spawned as a subagent, inject a standing system-prompt
     // instruction to always report results back via coms_send.
     const ownComsName = process.env.PI_COMS_NAME;
@@ -454,6 +553,9 @@ export default function (pi: ExtensionAPI) {
       }
       if (agentsTable) {
         sp += `\n\n${agentsTable}`;
+      }
+      if (scopedModelsNote) {
+        sp += scopedModelsNote;
       }
       return { systemPrompt: sp };
     });
