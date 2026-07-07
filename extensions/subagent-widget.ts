@@ -69,6 +69,7 @@ interface AgentDef {
   name: string;
   description: string;
   tools?: string;
+  model?: string;
   filePath: string;
 }
 
@@ -99,6 +100,7 @@ function scanAgentDir(dir: string): AgentDef[] {
           name: fm.name ?? f.slice(0, -3),
           description: fm.description ?? "",
           tools: fm.tools,
+          model: fm.model,
           filePath,
         };
       });
@@ -118,7 +120,7 @@ function buildAgentsTable(defs: AgentDef[]): string {
     `or fits a specialist's profile — and treat spawned agents as long-lived collaborators rather than single-use workers.` +
     ` Use \`subagent_create(task: "...", agent: "<name>")\` to spawn and \`coms_send\` to continue the conversation.\n\n`;
   for (const d of defs)
-    out += `- **${d.name}**: ${d.description}\n`;
+    out += `- **${d.name}**: ${d.description}${d.model ? ` _(model: ${d.model})_` : ""}\n`;
   return out;
 }
 
@@ -195,6 +197,7 @@ export default function (pi: ExtensionAPI) {
     task: string,
     purposeOverride: string | undefined,
     agentName: string | undefined,
+    modelOverride: string | undefined,
     ctx: any,
   ): Promise<SubState> {
     const id = nextId++;
@@ -214,9 +217,16 @@ export default function (pi: ExtensionAPI) {
     // named pool the parent is in. This keeps subagents invisible to other
     // named-pool peers while still reachable by the parent.
     const comsProject = parentName;
-    const model = ctx.model
-      ? `${ctx.model.provider}/${ctx.model.id}`
-      : undefined;
+    // Model precedence: explicit param > agent profile frontmatter > parent model.
+    let profileModel: string | undefined;
+    if (agentName) {
+      const pf = resolveAgentFile(agentName);
+      if (pf) profileModel = parseFrontmatter(fs.readFileSync(pf, "utf8")).model;
+    }
+    const model =
+      modelOverride ??
+      profileModel ??
+      (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
 
     const extDir = path.dirname(new URL(import.meta.url).pathname);
     const comsExt = path.join(extDir, "coms.ts");
@@ -329,6 +339,12 @@ export default function (pi: ExtensionAPI) {
             "Name of a specialist agent profile to apply (stem of a .md file in .pi/agents/ or ~/.pi/agent/agents/). The file's full contents are appended to the subagent's system prompt.",
         }),
       ),
+      model: Type.Optional(
+        Type.String({
+          description:
+            "Model to run the subagent on, as 'provider/id' (e.g. 'openrouter/google/gemini-3-flash-preview'). Overrides the agent profile's model and the parent's model. Use this to run cheaper workers on cheaper models.",
+        }),
+      ),
     }),
     execute: async (_callId, args, _signal, _onUpdate, ctx) => {
       if (!process.env.TMUX) {
@@ -351,7 +367,7 @@ export default function (pi: ExtensionAPI) {
           ],
         };
       }
-      const state = await spawnSubagent(args.task, args.purpose, args.agent, ctx);
+      const state = await spawnSubagent(args.task, args.purpose, args.agent, args.model, ctx);
       return {
         content: [
           {

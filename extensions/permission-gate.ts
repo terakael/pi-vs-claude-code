@@ -8,6 +8,7 @@ export default function (pi: ExtensionAPI) {
     /env(\s|$)/,
     /security\s+find-/,
     /git\s+push(\s|$)/,
+    /git\s+credential\s+fill(\s|$)/,
   ];
 
   pi.on("tool_call", async (event, ctx) => {

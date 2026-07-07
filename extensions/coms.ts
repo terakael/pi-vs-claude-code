@@ -253,7 +253,7 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function abbreviateModel(model: string, maxLen = 16): string {
+function abbreviateModel(model: string, maxLen = 20): string {
   let m = model || "";
   // Strip vendor prefixes that add noise (us., eu., ap. routing prefixes + anthropic/openai/meta etc.)
   m = m.replace(/^(us|eu|ap)\./, "");
@@ -794,7 +794,7 @@ export default function (pi: ExtensionAPI) {
     const card: AgentCard = {
       name: ident?.name ?? "unknown",
       purpose: ident?.purpose ?? "",
-      model: ctx?.model?.id ?? ident?.model ?? "unknown",
+      model: ctx?.model?.name ?? ctx?.model?.id ?? ident?.model ?? "unknown",
       color: ident?.color ?? "#36F9F6",
       context_used_pct: pct,
       is_running: effective.running,
@@ -1099,7 +1099,7 @@ export default function (pi: ExtensionAPI) {
 
     const endpoint = makeEndpoint(session_id);
     const cwd = ctx.cwd || process.cwd();
-    const model = ctx.model?.id ?? "unknown";
+    const model = ctx.model?.name ?? ctx.model?.id ?? "unknown";
 
     // Detect tmux location — stored in registry so peers can navigate here.
     let tmuxSession: string | undefined;
@@ -1476,7 +1476,7 @@ export default function (pi: ExtensionAPI) {
           session_id: identity.session_id,
           name: identity.name,
           purpose: identity.purpose,
-          model: ctx?.model?.id ?? identity.model,
+          model: ctx?.model?.name ?? ctx?.model?.id ?? identity.model,
           color: identity.color,
           pid: process.pid,
           endpoint: identity.endpoint,
