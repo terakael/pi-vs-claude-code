@@ -49,8 +49,13 @@ import { pickLevelOneName } from "./naming.ts";
 const COMS_DIR =
   process.env.PI_COMS_DIR || path.join(os.homedir(), ".pi", "coms");
 const MAX_HOPS = Number(process.env.PI_COMS_MAX_HOPS) || 5;
+const MAX_RELAY_DEPTH = 5; // max hops a status event propagates up the agent tree
 const PING_INTERVAL_MS = Number(process.env.PI_COMS_PING_INTERVAL_MS) || 10_000;
 const KEEPALIVE_INTERVAL_MS = 30_000;
+const TREE_PING_HOP_TIMEOUT_MS = 3_000;
+const TREE_PING_MAX_DEPTH = 5;
+const STALE_TIMEOUT_MS = PING_INTERVAL_MS * 3; // evict after 3 missed cascade cycles
+const IS_ROOT = !process.env.PI_PARENT_SESSION;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const LINE_CAP_BYTES = 64 * 1024;
 
@@ -67,7 +72,7 @@ const FALLBACK_PALETTE = [
 
 // ━━ Types ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-type EnvelopeType = "prompt" | "ping";
+type EnvelopeType = "prompt" | "ping" | "tree_ping";
 
 interface Envelope {
   type: EnvelopeType;
@@ -88,6 +93,32 @@ interface PromptEnvelope extends Envelope {
 
 interface PingEnvelope extends Envelope {
   type: "ping";
+}
+
+interface TreePingEnvelope extends Envelope {
+  type: "tree_ping";
+  request_id: string;  // shared across one full cascade cycle
+  max_depth: number;   // remaining depth budget (decrements each hop)
+}
+
+interface TreePongNode {
+  session_id: string;
+  card: AgentCard;
+  children: TreePongNode[];
+}
+
+interface TreePong {
+  type: "tree_pong";
+  request_id: string;
+  node: TreePongNode;
+}
+
+// Fire-and-forget push from a node to its lateral peers after cascade collection.
+// Same subtree content as tree_pong — lets peers see the sender's full subtree.
+interface TreeAnnounce {
+  type: "tree_announce";
+  sender_session: string;
+  node: TreePongNode;
 }
 
 interface AgentCard {
@@ -111,6 +142,12 @@ interface StatusMessage {
   is_running: boolean;
   is_blocked?: boolean;
   closing?: boolean;
+  // Relay fields — present when this event was forwarded up the tree.
+  // origin_session is WHO this event is about (may differ from sender_session).
+  // Falls back to sender_session for compat with older coms instances.
+  origin_session?: string;
+  origin_card?: AgentCard;
+  relay_depth?: number;
 }
 
 interface RegistryEntry {
@@ -816,56 +853,132 @@ export default function (pi: ExtensionAPI) {
   function handleStatus(_socket: net.Socket, msg: StatusMessage): void {
     // Status messages carry sender_session so we can match directly.
     // Fire-and-forget — no reply needed.
-    const sid: string = (msg as any).sender_session;
-    if (!sid) return;
+    const senderSid: string = (msg as any).sender_session;
+    if (!senderSid) return;
+
+    // origin_session is WHO this event is about. Differs from sender_session
+    // when the message has been relayed up the tree. Falls back to sender_session
+    // for compatibility with older coms instances that don't include origin_session.
+    const originSid: string = (msg as any).origin_session ?? senderSid;
+    const originCard: AgentCard | undefined = (msg as any).origin_card;
+    const relayDepth: number = (msg as any).relay_depth ?? 0;
+
+    // Ignore events about ourselves.
+    if (identity && originSid === identity.session_id) return;
+
     if (msg.closing) {
-      const closingCard = peerCards.get(sid);
+      const closingCard = peerCards.get(originSid);
       const wasChild =
         identity && closingCard
           ? agentRelationship(identity.name, closingCard.name) === "child"
           : false;
-      peerCards.delete(sid);
+      peerCards.delete(originSid);
       updateSpinnerTimer();
       host.requestRender();
       if (wasChild) void broadcastStatus(agentRunning);
+      // Relay close to parent + siblings if the sender was our direct child.
+      if (relayDepth < MAX_RELAY_DEPTH) {
+        const closingSenderCard = peerCards.get(senderSid) ?? closingCard;
+        const closingSenderIsMyDirectChild =
+          identity && closingSenderCard
+            ? closingSenderCard.name.startsWith(identity.name + "-") &&
+              !closingSenderCard.name.slice(identity.name.length + 1).includes("-")
+            : false;
+        if (closingSenderIsMyDirectChild) {
+          const cardForRelay = originCard ?? closingCard;
+          if (cardForRelay) {
+            void relayCardEvent(senderSid, originSid, cardForRelay, false, undefined, true, relayDepth);
+          }
+        }
+      }
       return;
     }
-    const card = peerCards.get(sid);
-    const isChild =
-      identity && card
-        ? agentRelationship(identity.name, card.name) === "child"
-        : false;
-    if (card) {
-      card.is_running = msg.is_running;
-      card.is_blocked = msg.is_blocked ?? false;
+
+    const existing = peerCards.get(originSid);
+
+    // Determine card data. Prefer fresh origin_card from the broadcast;
+    // fall back to existing card; for direct (non-relayed) peers look up registry.
+    let cardData: (AgentCard & { session_id?: string; cwd?: string; endpoint?: string }) | null = null;
+    if (originCard) {
+      cardData = originCard;
+    } else if (existing) {
+      cardData = existing as any;
+    } else if (originSid === senderSid) {
+      // Direct peer — look up from registry.
+      const entry = readAllDisplayEntries().find((e) => e.session_id === originSid);
+      if (entry) {
+        cardData = {
+          name: entry.name, purpose: entry.purpose, model: entry.model,
+          color: entry.color, context_used_pct: null,
+          session_id: entry.session_id, cwd: entry.cwd, endpoint: entry.endpoint,
+        };
+      }
+    }
+    if (!cardData) return;
+
+    const cardName = cardData.name ?? existing?.name;
+    if (!cardName) return;
+
+    const isChild = identity
+      ? agentRelationship(identity.name, cardName) === "child"
+      : false;
+
+    if (existing) {
+      // Update in place, refreshing card fields if we have fresh data.
+      if (originCard) {
+        existing.name = originCard.name ?? existing.name;
+        existing.model = originCard.model ?? existing.model;
+        existing.color = originCard.color ?? existing.color;
+        existing.purpose = originCard.purpose ?? existing.purpose;
+        existing.context_used_pct = originCard.context_used_pct ?? existing.context_used_pct;
+      }
+      existing.is_running = msg.is_running;
+      existing.is_blocked = msg.is_blocked ?? false;
+      (existing as any).lastSeenAt = Date.now();
       updateSpinnerTimer();
       host.requestRender();
       if (isChild) void broadcastStatus(agentRunning);
     } else {
-      // Unknown session — new peer or reloaded peer with new session_id.
-      // Registry was written before the broadcast; look it up directly.
-      const entry = readAllDisplayEntries().find((e) => e.session_id === sid);
-      if (entry) {
-        peerCards.set(sid, {
-          session_id: sid,
-          name: entry.name,
-          purpose: entry.purpose,
-          model: entry.model,
-          color: entry.color,
-          cwd: entry.cwd,
-          endpoint: entry.endpoint,
-          is_running: msg.is_running ?? false,
-          is_blocked: msg.is_blocked ?? false,
-          context_used_pct: null,
-          staleCount: 0,
-        });
-        const newIsChild = identity
-          ? agentRelationship(identity.name, entry.name) === "child"
-          : false;
-        updateSpinnerTimer();
-        host.requestRender();
-        if (newIsChild) void broadcastStatus(agentRunning);
-      }
+      peerCards.set(originSid, {
+        session_id: originSid,
+        name: cardName,
+        purpose: cardData.purpose ?? "",
+        model: cardData.model ?? "unknown",
+        color: cardData.color ?? fallbackColor(originSid),
+        cwd: (cardData as any).cwd,
+        endpoint: (cardData as any).endpoint,
+        context_used_pct: cardData.context_used_pct ?? null,
+        is_running: msg.is_running ?? false,
+        is_blocked: msg.is_blocked ?? false,
+        staleCount: 0,
+        lastSeenAt: Date.now(),
+      } as any);
+      updateSpinnerTimer();
+      host.requestRender();
+      if (isChild) void broadcastStatus(agentRunning);
+    }
+
+    // Relay to parent + siblings if the sender is our direct child.
+    // Direct child = exactly one name segment beyond ours (e.g. amber-frog under amber).
+    // We never relay downstream to our own children — they already received the
+    // broadcast from the origin's parent in the first hop.
+    const senderCard = peerCards.get(senderSid);
+    const senderIsMyDirectChild =
+      identity && senderCard
+        ? senderCard.name.startsWith(identity.name + "-") &&
+          !senderCard.name.slice(identity.name.length + 1).includes("-")
+        : false;
+    if (senderIsMyDirectChild && relayDepth < MAX_RELAY_DEPTH) {
+      const relayCard: AgentCard = {
+        name: cardName,
+        purpose: cardData.purpose ?? "",
+        model: cardData.model ?? "unknown",
+        color: cardData.color ?? fallbackColor(originSid),
+        context_used_pct: cardData.context_used_pct ?? 0,
+        is_running: msg.is_running,
+        is_blocked: msg.is_blocked,
+      };
+      void relayCardEvent(senderSid, originSid, relayCard, msg.is_running, msg.is_blocked, false, relayDepth);
     }
   }
 
@@ -886,6 +999,61 @@ export default function (pi: ExtensionAPI) {
     return { running, blocked };
   }
 
+  // Forward a child/descendant card event one hop upstream.
+  // senderSid: who sent US this event — excluded from relay targets to prevent echoing.
+  // originSid: who the event is actually about.
+  function relayCardEvent(
+    senderSid: string,
+    originSid: string,
+    originCard: AgentCard,
+    isRunning: boolean,
+    isBlocked: boolean | undefined,
+    closing: boolean,
+    relayDepth: number,
+  ): Promise<void> {
+    if (!identity || relayDepth >= MAX_RELAY_DEPTH) return Promise.resolve();
+    const entries = readAllDisplayEntries();
+    const payload =
+      JSON.stringify({
+        type: "status",
+        is_running: isRunning,
+        is_blocked: isBlocked || undefined,
+        closing: closing || undefined,
+        sender_session: identity.session_id,
+        origin_session: originSid,
+        origin_card: originCard,
+        relay_depth: relayDepth + 1,
+      }) + "\n";
+    const sends = entries
+      .filter(
+        (e) =>
+          e.session_id !== identity!.session_id &&
+          e.session_id !== originSid &&   // don't echo back to origin
+          e.session_id !== senderSid &&   // don't echo back to who told us
+          // Only relay to parent and siblings — never downstream to our own children.
+          // The first-hop broadcast (from the origin's direct parent) already covered them.
+          agentRelationship(identity!.name, e.name) !== "child",
+      )
+      .map(
+        (entry) =>
+          new Promise<void>((resolve) => {
+            try {
+              const sock = net.createConnection(entry.endpoint);
+              const done = () => resolve();
+              sock.once("connect", () => {
+                try { sock.write(payload); sock.end(); } catch { /* ignore */ }
+              });
+              sock.once("close", done);
+              sock.once("error", done);
+              setTimeout(done, 500);
+            } catch {
+              resolve();
+            }
+          }),
+      );
+    return Promise.all(sends).then(() => undefined);
+  }
+
   function broadcastPeerClosed(deadSessionId: string): Promise<void> {
     if (!identity) return Promise.resolve();
     const entries = readAllDisplayEntries();
@@ -895,6 +1063,7 @@ export default function (pi: ExtensionAPI) {
         is_running: false,
         closing: true,
         sender_session: deadSessionId,
+        origin_session: deadSessionId,
       }) + "\n";
     const sends = entries
       .filter(
@@ -937,6 +1106,16 @@ export default function (pi: ExtensionAPI) {
     const effective = closing
       ? { running: false, blocked: false }
       : recomputeEffective();
+    const ctx = currentCtx;
+    const selfCard: AgentCard = {
+      name: identity.name,
+      purpose: identity.purpose,
+      model: ctx?.model?.name ?? ctx?.model?.id ?? identity.model,
+      color: identity.color,
+      context_used_pct: Math.round(ctx?.getContextUsage()?.percent ?? 0),
+      is_running: effective.running,
+      is_blocked: effective.blocked || undefined,
+    };
     const payload =
       JSON.stringify({
         type: "status",
@@ -944,6 +1123,9 @@ export default function (pi: ExtensionAPI) {
         is_blocked: effective.blocked || undefined,
         closing: closing || undefined,
         sender_session: identity.session_id,
+        origin_session: identity.session_id,
+        origin_card: selfCard,
+        relay_depth: 0,
       }) + "\n";
     const sends = entries
       .filter((e) => e.session_id !== identity!.session_id)
@@ -1033,6 +1215,10 @@ export default function (pi: ExtensionAPI) {
           handleStatus(socket, parsed as StatusMessage);
           return;
         }
+        if (parsed && parsed.type === "tree_announce") {
+          handleTreeAnnounce(parsed as TreeAnnounce);
+          return;
+        }
         const mid =
           parsed && typeof parsed.msg_id === "string" ? parsed.msg_id : "";
         nack(socket, mid, "malformed envelope");
@@ -1043,6 +1229,8 @@ export default function (pi: ExtensionAPI) {
           handlePrompt(socket, parsed as PromptEnvelope);
         } else if (parsed.type === "ping") {
           handlePing(socket, parsed as PingEnvelope);
+        } else if (parsed.type === "tree_ping") {
+          void handleTreePing(socket, parsed as TreePingEnvelope);
         } else if (parsed.type === "status") {
           handleStatus(socket, parsed as StatusMessage);
         } else {
@@ -1455,8 +1643,10 @@ export default function (pi: ExtensionAPI) {
     broadcastStatus(false).catch(() => {});
 
     // 8. Start ping + keepalive cycles.
+    // Only root runs the cascade timer. Non-root agents ping reactively when
+    // they receive a tree_ping from their parent (see handleTreePing).
     pingTimer = setInterval(() => {
-      refreshPool().catch(() => {});
+      if (IS_ROOT) runCascadePing().catch(() => {});
     }, PING_INTERVAL_MS);
     try {
       (pingTimer as any).unref?.();
@@ -1505,6 +1695,8 @@ export default function (pi: ExtensionAPI) {
       } catch {
         /* best-effort */
       }
+      // Cleanup stale cards on every keepalive tick (all agents).
+      cleanupStaleCards();
     }, KEEPALIVE_INTERVAL_MS);
     try {
       (keepaliveTimer as any).unref?.();
@@ -1513,10 +1705,257 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Kick one ping cycle immediately so the widget populates fast.
-    refreshPool().catch(() => {});
+    if (IS_ROOT) runCascadePing().catch(() => {});
   });
 
   // ━━ Helpers used by tools ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  // ━━ Cascading tree ping ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  /** Build our own AgentCard for inclusion in tree_pong responses. */
+  function selfCard(): AgentCard {
+    const ctx = currentCtx;
+    const ident = identity;
+    const pct = ctx ? Math.round(ctx.getContextUsage()?.percent ?? 0) : 0;
+    const effective = recomputeEffective();
+    return {
+      name: ident?.name ?? "unknown",
+      purpose: ident?.purpose ?? "",
+      model: ctx?.model?.name ?? ctx?.model?.id ?? ident?.model ?? "unknown",
+      color: ident?.color ?? "#36F9F6",
+      context_used_pct: pct,
+      is_running: effective.running,
+      is_blocked: effective.blocked || undefined,
+    };
+  }
+
+  /** Return registry entries for our direct children only. */
+  function directChildEntries(): RegistryEntry[] {
+    if (!identity) return [];
+    const myName = identity.name;
+    const entries = readAllDisplayEntries();
+    return entries.filter((e) => {
+      if (e.session_id === identity!.session_id) return false;
+      // Direct child: exactly one more name segment
+      return (
+        e.name.startsWith(myName + "-") &&
+        !e.name.slice(myName.length + 1).includes("-")
+      );
+    });
+  }
+
+  /** Return registry entries for siblings (same parent pool, not parent/child). */
+  /**
+   * Handles an incoming tree_ping: fans out to our direct children, collects
+   * their tree_pong responses within the hop timeout, builds a TreePongNode
+   * for our own subtree, updates local peerCards from child subtree data,
+   * then writes the tree_pong back to the calling socket.
+   */
+  async function handleTreePing(
+    socket: net.Socket,
+    env: TreePingEnvelope,
+  ): Promise<void> {
+    if (!identity) {
+      try { socket.end(); } catch { /* ignore */ }
+      return;
+    }
+
+    const childNodes: TreePongNode[] = [];
+
+    if (env.max_depth > 0) {
+      const children = directChildEntries();
+      if (children.length > 0) {
+        const childPing: TreePingEnvelope = {
+          type: "tree_ping",
+          msg_id: ulid(),
+          sender_session: identity.session_id,
+          sender_endpoint: identity.endpoint,
+          hops: 0,
+          timestamp: nowIso(),
+          request_id: env.request_id,
+          max_depth: env.max_depth - 1,
+        };
+
+        const results = await Promise.allSettled(
+          children.map(async (child) => {
+            const resp = await Promise.race([
+              sendEnvelope(child.endpoint, childPing),
+              new Promise<null>((res) =>
+                setTimeout(() => res(null), TREE_PING_HOP_TIMEOUT_MS),
+              ),
+            ]);
+            return { child, resp };
+          }),
+        );
+
+        for (const r of results) {
+          if (r.status === "fulfilled" && r.value.resp?.type === "tree_pong") {
+            const pong = r.value.resp as TreePong;
+            childNodes.push(pong.node);
+            // Update peerCards with freshly received subtree data
+            applyTreePongNode(pong.node);
+          } else {
+            // Timed out or failed — note the child; it will be evicted by cleanupStaleCards
+            // if it stays absent long enough.
+          }
+        }
+      }
+    }
+
+    // Build our own node, announce to lateral peers, then respond to parent.
+    const myNode: TreePongNode = {
+      session_id: identity.session_id,
+      card: selfCard(),
+      children: childNodes,
+    };
+    void broadcastTreeAnnounce(myNode);
+
+    const pong: TreePong = {
+      type: "tree_pong",
+      request_id: env.request_id,
+      node: myNode,
+    };
+    try {
+      socket.write(JSON.stringify(pong) + "\n");
+    } catch { /* ignore */ }
+    try { socket.end(); } catch { /* ignore */ }
+  }
+
+  /**
+   * Recursively applies a TreePongNode subtree to peerCards.
+   * Sets lastSeenAt on every card touched so cleanupStaleCards can evict by TTL.
+   */
+  function applyTreePongNode(node: TreePongNode): void {
+    if (!identity || node.session_id === identity.session_id) return;
+    const now = Date.now();
+    const existing = peerCards.get(node.session_id);
+    if (existing) {
+      // Refresh in place.
+      Object.assign(existing, node.card);
+      (existing as any).lastSeenAt = now;
+      existing.staleCount = 0;
+    } else {
+      peerCards.set(node.session_id, {
+        ...node.card,
+        session_id: node.session_id,
+        staleCount: 0,
+        lastSeenAt: now,
+      } as any);
+    }
+    updateSpinnerTimer();
+    host.requestRender();
+    for (const child of node.children) {
+      applyTreePongNode(child);
+    }
+  }
+
+  /**
+   * Fire-and-forget: broadcast our subtree node to all lateral peers so they
+   * can see our children without needing to ping us.
+   */
+  function broadcastTreeAnnounce(node: TreePongNode): void {
+    if (!identity) return;
+    const entries = readAllDisplayEntries().filter(
+      (e) => e.session_id !== identity!.session_id,
+    );
+    const payload = JSON.stringify({
+      type: "tree_announce",
+      sender_session: identity.session_id,
+      node,
+    } satisfies TreeAnnounce) + "\n";
+    for (const entry of entries) {
+      try {
+        const sock = net.createConnection({ path: entry.endpoint });
+        sock.once("connect", () => {
+          try { sock.write(payload); sock.end(); } catch { /* ignore */ }
+        });
+        sock.once("error", () => { try { sock.destroy(); } catch { /* ignore */ } });
+        setTimeout(() => { try { sock.destroy(); } catch { /* ignore */ } }, 1000);
+      } catch { /* ignore */ }
+    }
+  }
+
+  /** Handle an incoming tree_announce from a peer: apply their subtree to peerCards. */
+  function handleTreeAnnounce(msg: TreeAnnounce): void {
+    if (!identity) return;
+    if (msg.sender_session === identity.session_id) return;
+    if (!msg.node) return;
+    applyTreePongNode(msg.node);
+    if (currentCtx?.hasUI) installPoolWidget(currentCtx);
+  }
+
+  /**
+   * Evict peerCards that haven't been seen (via tree_announce / tree_pong / status)
+   * within STALE_TIMEOUT_MS. Called from the keepalive timer so all agents benefit.
+   */
+  function cleanupStaleCards(): void {
+    const cutoff = Date.now() - STALE_TIMEOUT_MS;
+    let changed = false;
+    for (const [sid, card] of peerCards.entries()) {
+      if (identity && sid === identity.session_id) continue;
+      const lastSeen = (card as any).lastSeenAt ?? 0;
+      if (lastSeen < cutoff) {
+        peerCards.delete(sid);
+        changed = true;
+      }
+    }
+    if (changed && currentCtx?.hasUI) installPoolWidget(currentCtx);
+  }
+
+  /**
+   * Root-only: initiates a full cascading tree ping to all direct children.
+   * Children process the cascade, then broadcast tree_announce to their peers
+   * (including us). Root's own peerCards are updated via those announces.
+   * For flat peer setups (no children), we broadcast our own announce to peers.
+   */
+  async function runCascadePing(): Promise<void> {
+    if (!identity) return;
+
+    const children = directChildEntries();
+
+    if (children.length === 0) {
+      // Flat peer / leaf root — announce ourselves so peers know we're alive.
+      broadcastTreeAnnounce({
+        session_id: identity.session_id,
+        card: selfCard(),
+        children: [],
+      });
+      return;
+    }
+
+    const requestId = ulid();
+    const cascadePing: TreePingEnvelope = {
+      type: "tree_ping",
+      msg_id: ulid(),
+      sender_session: identity.session_id,
+      sender_endpoint: identity.endpoint,
+      hops: 0,
+      timestamp: nowIso(),
+      request_id: requestId,
+      max_depth: TREE_PING_MAX_DEPTH,
+    };
+
+    const results = await Promise.allSettled(
+      children.map(async (child) => {
+        const resp = await Promise.race([
+          sendEnvelope(child.endpoint, cascadePing),
+          new Promise<null>((res) =>
+            setTimeout(() => res(null), TREE_PING_HOP_TIMEOUT_MS),
+          ),
+        ]);
+        return { child, resp };
+      }),
+    );
+
+    for (const r of results) {
+      if (r.status === "fulfilled" && r.value.resp?.type === "tree_pong") {
+        // Apply child's subtree so root's widget is populated immediately
+        // without waiting for tree_announces to arrive.
+        applyTreePongNode((r.value.resp as TreePong).node);
+      }
+      // Absent children are handled by cleanupStaleCards (TTL-based eviction).
+    }
+  }
 
   async function pingPeer(endpoint: string): Promise<AgentCard | null> {
     if (!identity) return null;
@@ -1578,6 +2017,7 @@ export default function (pi: ExtensionAPI) {
     running: boolean;
     blocked: boolean;
     relationship: "parent" | "child" | "sibling" | "peer";
+    depth: number; // 0=direct peer, 1=child, 2=grandchild, etc. — drives tree indentation
   }
 
   function buildPoolRows(): PoolRow[] {
@@ -1587,6 +2027,15 @@ export default function (pi: ExtensionAPI) {
 
     const rows: PoolRow[] = [];
     const seenSessions = new Set<string>();
+
+    const myName = identity?.name ?? "";
+    // Depth = how many name segments the peer has beyond my own level.
+    // Examples from grave-cord's view: grave-ash → 0, grave-ash-cairn → 1, grave → 0 (parent clamped)
+    const mySegments = myName ? myName.split("-").length : 0;
+    const nameDepth = (peerName: string): number => {
+      if (!myName) return 0;
+      return Math.max(0, peerName.split("-").length - mySegments);
+    };
 
     for (const [sid, card] of peerCards.entries()) {
       if (identity && sid === identity.session_id) continue;
@@ -1598,12 +2047,15 @@ export default function (pi: ExtensionAPI) {
         purpose: card.purpose,
         pct: card.context_used_pct,
         pending: false,
-        stale: (card.staleCount ?? 0) >= 3,
+        stale: (card as any).lastSeenAt
+          ? Date.now() - (card as any).lastSeenAt > STALE_TIMEOUT_MS * 0.67
+          : (card.staleCount ?? 0) >= 3,
         running: card.is_running ?? false,
         blocked: card.is_blocked ?? false,
         relationship: identity
           ? agentRelationship(identity.name, card.name)
           : "peer",
+        depth: nameDepth(card.name),
       });
     }
 
@@ -1626,6 +2078,7 @@ export default function (pi: ExtensionAPI) {
         relationship: identity
           ? agentRelationship(identity.name, entry.name)
           : "peer",
+        depth: nameDepth(entry.name),
       });
     }
 
@@ -1777,12 +2230,18 @@ export default function (pi: ExtensionAPI) {
       const isSelected = i === effectiveSel;
       const pctLabel = r.pct == null ? "--%" : `${r.pct}%`;
 
-      const relIcon = { parent: "↑", child: "↓", sibling: "~", peer: " " }[
-        r.relationship
-      ];
+      // Use └ icon + indent when this is a tree node below the top row:
+      //   depth > 1: any deeply nested agent (grandchild+ from root's view)
+      //   depth === 1 AND relationship !== "child": sibling's child visible from non-root
+      // Use relationship icon otherwise (depth 0, or depth 1 direct own child → ↓).
+      const useRelIcon = r.depth === 0 || (r.depth === 1 && r.relationship === "child");
+      const indent = useRelIcon ? "" : "  ".repeat(Math.max(1, r.depth - 1));
+      const relIcon = useRelIcon
+        ? theme.fg("dim", { parent: "↑", child: "↓", sibling: "~", peer: " " }[r.relationship] ?? " ")
+        : theme.fg("dim", "└ ");
 
       if (r.stale) {
-        const dimRow = `✗ ${relIcon}${r.name.padEnd(11)} ${abbreviateModel(r.model).padEnd(16)}  ${pctLabel.padStart(4)}  —  ${r.purpose || ""}`;
+        const dimRow = `✗ ${indent}${r.name.padEnd(11)} ${abbreviateModel(r.model).padEnd(16)}  ${pctLabel.padStart(4)}  —  ${r.purpose || ""}`;
         const truncated = truncateToWidth(
           (isSelected ? "❯ " : "  ") + theme.fg("dim", dimRow),
           width,
@@ -1801,7 +2260,9 @@ export default function (pi: ExtensionAPI) {
           : r.pending
             ? theme.fg("dim", "●")
             : hexFg(r.color, "●");
-      const namePart = theme.fg("accent", r.name.padEnd(11));
+      const namePart = !useRelIcon
+        ? theme.fg("dim", (indent + r.name).padEnd(11 + indent.length))
+        : theme.fg("accent", r.name.padEnd(11));
       const modelPart = theme.fg("dim", abbreviateModel(r.model).padEnd(16));
       const pctPart = theme.fg(
         r.pending ? "dim" : "accent",
@@ -1810,12 +2271,11 @@ export default function (pi: ExtensionAPI) {
       const sep = theme.fg("dim", "  —  ");
       const purposePart = theme.fg("muted", r.purpose || "");
 
-      const iconPart = theme.fg("dim", relIcon);
       const rawLine =
         (isSelected ? "❯ " : "  ") +
         swatch +
         " " +
-        iconPart +
+        relIcon +
         namePart +
         " " +
         modelPart +
@@ -1849,76 +2309,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   // ━━ Ping cycle ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  async function refreshPool(): Promise<void> {
-    if (!identity) return;
-    // Prune dead entries across all display pools, deduped by session_id.
-    const seen = new Set<string>();
-    const live: RegistryEntry[] = [];
-    for (const p of allProjects()) {
-      for (const e of pruneDeadEntries(p)) {
-        if (!seen.has(e.session_id)) {
-          seen.add(e.session_id);
-          live.push(e);
-        }
-      }
-    }
-
-    const peers = live.filter(
-      (e) =>
-        e.session_id !== identity!.session_id &&
-        (includeExplicit || !e.explicit),
-    );
-
-    const results = await Promise.allSettled(
-      peers.map(async (peer) => {
-        const pingEnv: PingEnvelope = {
-          type: "ping",
-          msg_id: ulid(),
-          sender_session: identity!.session_id,
-          sender_endpoint: identity!.endpoint,
-          hops: 0,
-          timestamp: nowIso(),
-        };
-        const reply = await sendEnvelope(peer.endpoint, pingEnv);
-        return { peer, pong: reply as Pong };
-      }),
-    );
-
-    const seenSessions = new Set<string>();
-    let changed = false;
-
-    for (const r of results) {
-      if (r.status === "fulfilled" && r.value.pong && r.value.pong.agent_card) {
-        const { peer, pong } = r.value;
-        seenSessions.add(peer.session_id);
-        const prev = peerCards.get(peer.session_id);
-        const next = { ...pong.agent_card, staleCount: 0 };
-        if (
-          !prev ||
-          JSON.stringify({ ...prev, staleCount: 0 }) !== JSON.stringify(next)
-        ) {
-          peerCards.set(peer.session_id, next);
-          updateSpinnerTimer();
-          changed = true;
-        }
-      }
-    }
-
-    for (const [sid, card] of peerCards.entries()) {
-      if (identity && sid === identity.session_id) continue;
-      if (!seenSessions.has(sid)) {
-        card.staleCount = (card.staleCount ?? 0) + 1;
-        if (card.staleCount > 6) {
-          peerCards.delete(sid);
-        }
-        changed = true;
-      }
-    }
-
-    if (changed && currentCtx?.hasUI) {
-      installPoolWidget(currentCtx);
-    }
-  }
+  // refreshPool() removed — replaced by runCascadePing() (root) + refreshSiblings() (non-root).
 
   function listProjects(): string[] {
     const root = path.join(COMS_DIR, "projects");
@@ -2280,7 +2671,7 @@ export default function (pi: ExtensionAPI) {
           /* ignore */
         }
       }
-      await refreshPool();
+      if (IS_ROOT) await runCascadePing();
     },
   });
 
