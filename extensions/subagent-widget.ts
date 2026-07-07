@@ -1,13 +1,19 @@
 /**
- * Subagent Widget — tmux-based subagents with a navigator UI
+ * Subagent Widget — spawn and manage subagents (tmux or headless)
  *
- * Each subagent is a full Pi TUI running in a detached tmux session.
- * Jump into any of them live from the navigator.
+ * Each subagent is a full Pi instance. In tmux mode it runs as a TUI in a
+ * detached tmux window. In headless mode it runs as `pi --mode rpc` with an
+ * open stdin pipe as a keepalive, no TTY required (k8s / batch pipelines).
  *
- * Usage: pi -e extensions/subagent-widget.ts   (must be inside tmux)
- * Then:
- *   /sub <task>   — spawn a new subagent
- *   /sub          — open navigator to pick and enter a running subagent
+ * Backend selection (subagent_create):
+ *   PI_SUBAGENT_BACKEND=tmux     — force tmux (requires TMUX env; errors otherwise)
+ *   PI_SUBAGENT_BACKEND=headless — force headless
+ *   (unset)                      — tmux when TMUX present, headless otherwise
+ *
+ * Headless subagents always spawn headless children (TMUX is stripped from
+ * their env and PI_SUBAGENT_BACKEND=headless is propagated).
+ *
+ * Usage: pi -e extensions/subagent-widget.ts
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -19,14 +25,32 @@ import * as os from "os";
 import * as path from "path";
 import { pickSubagentName } from "./naming.ts";
 
-const { execFile } = require("child_process") as typeof import("child_process");
+const { execFile, spawn } = require("child_process") as typeof import("child_process");
 
-// ── Coms socket injection ────────────────────────────────────────────────────
+// ── Backend selector ──────────────────────────────────────────────────────────
 
-// Sends the initial task to a freshly-spawned subagent via its coms unix socket
-// rather than tmux send-keys. Works for both tmux and headless backends because
-// coms.ts binds the socket *before* writing the registry file, so registry
-// presence guarantees the socket is ready.
+function resolveBackendMode(requestHeadless?: boolean): "tmux" | "headless" {
+  const override = process.env.PI_SUBAGENT_BACKEND;
+  // System-level env override takes highest priority.
+  if (override === "tmux") {
+    if (!process.env.TMUX)
+      throw new Error(
+        "PI_SUBAGENT_BACKEND=tmux requires a tmux session — unset the override or run inside tmux",
+      );
+    return "tmux";
+  }
+  if (override === "headless") return "headless";
+  // Tool-level request.
+  if (requestHeadless) return "headless";
+  // Default: tmux when available, headless otherwise.
+  return process.env.TMUX ? "tmux" : "headless";
+}
+
+// ── Coms socket injection ─────────────────────────────────────────────────────
+
+// Sends the initial task to a freshly-spawned subagent via its coms unix socket.
+// Works for both backends: coms.ts binds the socket *before* writing the registry
+// file, so registry presence guarantees the socket is ready.
 async function sendInitialTaskViaComs(
   comsName: string,
   comsProject: string,
@@ -36,24 +60,35 @@ async function sendInitialTaskViaComs(
   const comsDir =
     process.env.PI_COMS_DIR || path.join(os.homedir(), ".pi", "coms");
 
-  // Read subagent registry to get its socket endpoint.
   const subRegistryFile = path.join(
-    comsDir, "projects", comsProject, "agents", `${comsName}.json`,
+    comsDir,
+    "projects",
+    comsProject,
+    "agents",
+    `${comsName}.json`,
   );
   const subEntry = JSON.parse(fs.readFileSync(subRegistryFile, "utf-8"));
   const endpoint = subEntry.endpoint as string;
 
-  // Best-effort: read parent's own registry for proper sender identity.
+  // Best-effort: use parent's real identity as sender.
   let senderSession = crypto.randomBytes(8).toString("hex");
   let senderEndpoint = "";
   try {
     const parentRegistryFile = path.join(
-      comsDir, "projects", parentName, "agents", `${parentName}.json`,
+      comsDir,
+      "projects",
+      parentName,
+      "agents",
+      `${parentName}.json`,
     );
-    const parentEntry = JSON.parse(fs.readFileSync(parentRegistryFile, "utf-8"));
+    const parentEntry = JSON.parse(
+      fs.readFileSync(parentRegistryFile, "utf-8"),
+    );
     senderSession = parentEntry.session_id;
     senderEndpoint = parentEntry.endpoint;
-  } catch { /* use generated fallbacks */ }
+  } catch {
+    /* use generated fallbacks */
+  }
 
   const envelope = {
     type: "prompt",
@@ -75,10 +110,17 @@ async function sendInitialTaskViaComs(
     const fail = (err: Error) => {
       if (settled) return;
       settled = true;
-      try { sock.destroy(); } catch { /* ignore */ }
+      try {
+        sock.destroy();
+      } catch {
+        /* ignore */
+      }
       reject(err);
     };
-    const timer = setTimeout(() => fail(new Error("coms inject timeout")), 5_000);
+    const timer = setTimeout(
+      () => fail(new Error("coms inject timeout")),
+      5_000,
+    );
     sock.once("error", fail);
     sock.once("connect", () => {
       try {
@@ -95,7 +137,11 @@ async function sendInitialTaskViaComs(
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        try { sock.end(); } catch { /* ignore */ }
+        try {
+          sock.end();
+        } catch {
+          /* ignore */
+        }
         try {
           const resp = JSON.parse(buf.slice(0, nl));
           if (resp.type === "nack") reject(new Error(resp.error || "nack"));
@@ -126,13 +172,14 @@ function currentTmuxSession(): Promise<string> {
   return tmux("display-message", "-p", "#S");
 }
 
-// Wait for the subagent's coms registry entry to appear — a reliable signal
-// that Pi has fully initialised (coms session_start completed and the socket
-// is bound). Much more deterministic than polling pane content.
+// ── Coms registry polling ─────────────────────────────────────────────────────
+
+// Wait for the subagent's coms registry entry to appear — confirms coms
+// session_start completed and the socket is bound.
 async function waitForComsRegistry(
   comsName: string,
   project: string,
-  timeoutMs = 10_000,
+  timeoutMs = 15_000,
 ): Promise<boolean> {
   const comsDir =
     process.env.PI_COMS_DIR || path.join(os.homedir(), ".pi", "coms");
@@ -222,7 +269,7 @@ function findProjectAgentDir(): string | undefined {
     const candidate = path.join(dir, ".pi", "agents");
     if (fs.existsSync(candidate)) return candidate;
     const parent = path.dirname(dir);
-    if (parent === dir) return undefined; // filesystem root
+    if (parent === dir) return undefined;
     dir = parent;
   }
 }
@@ -233,7 +280,13 @@ function resolveAgentFile(name: string): string | undefined {
     const local = path.join(projectDir, `${name}.md`);
     if (fs.existsSync(local)) return local;
   }
-  const global_ = path.join(os.homedir(), ".pi", "agent", "agents", `${name}.md`);
+  const global_ = path.join(
+    os.homedir(),
+    ".pi",
+    "agent",
+    "agents",
+    `${name}.md`,
+  );
   if (fs.existsSync(global_)) return global_;
   return undefined;
 }
@@ -243,11 +296,16 @@ function resolveAgentFile(name: string): string | undefined {
 interface SubState {
   id: number;
   task: string;
-  tmuxSession: string; // shared subs session, e.g. "main-subs"
-  tmuxWindow: string; // per-subagent window name = comsName
-  comsName: string; // coms identity, e.g. "amber-basin"
+  comsName: string;
   sessionFile: string;
   startedAt: number;
+  mode: "tmux" | "headless";
+  // tmux only
+  tmuxSession?: string;
+  tmuxWindow?: string;
+  // headless only
+  pid?: number;
+  logPath?: string;
 }
 
 // ── Extension ─────────────────────────────────────────────────────────────────
@@ -271,46 +329,95 @@ export default function (pi: ExtensionAPI) {
     return path.join(dir, `subagent-${id}-${Date.now()}.jsonl`);
   }
 
+  function makeLogFile(id: number): string {
+    const dir = path.join(
+      os.homedir(),
+      ".pi",
+      "agent",
+      "sessions",
+      "subagents",
+    );
+    fs.mkdirSync(dir, { recursive: true });
+    return path.join(dir, `subagent-${id}-${Date.now()}.log`);
+  }
+
+  // ── Liveness ───────────────────────────────────────────────────────────────
+
   async function isAlive(state: SubState): Promise<boolean> {
+    if (state.mode === "headless") {
+      if (!state.pid) return false;
+      try {
+        process.kill(state.pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    // tmux path
     try {
       const windows = await tmux(
         "list-windows",
         "-t",
-        state.tmuxSession,
+        state.tmuxSession!,
         "-F",
         "#{window_name}",
       );
-      return windows.split("\n").includes(state.tmuxWindow);
+      return windows.split("\n").includes(state.tmuxWindow!);
     } catch {
       return false;
     }
   }
+
+  // ── Cascade kill headless children ─────────────────────────────────────────
+
+  function killHeadlessChildren(): void {
+    for (const state of agents.values()) {
+      if (state.mode === "headless" && state.pid) {
+        try {
+          process.kill(-state.pid, "SIGTERM");
+        } catch {
+          /* already dead */
+        }
+      }
+    }
+  }
+
+  // Register on process exit so cascade fires even on abrupt termination.
+  // POSIX only — process.kill(-pid) is not supported on Windows.
+  if (process.platform !== "win32") {
+    process.on("exit", killHeadlessChildren);
+  }
+
+  // ── Spawn ──────────────────────────────────────────────────────────────────
 
   async function spawnSubagent(
     task: string,
     purposeOverride: string | undefined,
     agentName: string | undefined,
     modelOverride: string | undefined,
+    mode: "tmux" | "headless",
     ctx: any,
   ): Promise<SubState> {
     const id = nextId++;
     const sessionFile = makeSessionFile(id);
     const parentName = process.env.PI_COMS_NAME ?? "agent";
-    // Scan parent's pool to find live names for collision avoidance.
-    const comsDir = process.env.PI_COMS_DIR || path.join(os.homedir(), ".pi", "coms");
+
+    // Collision-safe subagent name from parent's coms pool.
+    const comsDir =
+      process.env.PI_COMS_DIR || path.join(os.homedir(), ".pi", "coms");
     const poolDir = path.join(comsDir, "projects", parentName, "agents");
     const existingNames = new Set<string>();
     try {
       for (const f of fs.readdirSync(poolDir)) {
         if (f.endsWith(".json")) existingNames.add(f.slice(0, -5));
       }
-    } catch { /* pool dir may not exist yet */ }
+    } catch {
+      /* pool dir may not exist yet */
+    }
     const comsName = pickSubagentName(parentName, existingNames);
-    // Subagents always join the parent's own-name pool, regardless of what
-    // named pool the parent is in. This keeps subagents invisible to other
-    // named-pool peers while still reachable by the parent.
     const comsProject = parentName;
-    // Model precedence: explicit param > agent profile frontmatter > parent model.
+
+    // Model: explicit > agent profile frontmatter > parent model.
     let profileModel: string | undefined;
     if (agentName) {
       const pf = resolveAgentFile(agentName);
@@ -330,90 +437,140 @@ export default function (pi: ExtensionAPI) {
       .replace(/\s+/g, " ")
       .trim();
 
-    const piCmd = [
-      "pi",
-      "-e",
-      shellQuote(comsExt),
-      "-e",
-      shellQuote(widgetExt),
-      "--cname",
-      shellQuote(comsName),
-      "--project",
-      shellQuote(comsProject),
-      "--session",
-      shellQuote(sessionFile),
-      "--purpose",
-      shellQuote(purpose),
-
-      ...(model ? ["--model", shellQuote(model)] : []),
-    ].join(" ");
-
-    const parentSession = await currentTmuxSession();
-    const subsSession = `${process.env.PI_COMS_NAME ?? parentSession}-subs`;
-    const tmuxWindow = comsName;
-    const envArgs = [
-      "-e",
-      `PI_PARENT_SESSION=${parentSession}`,
-      "-e",
-      `PI_COMS_PROJECT=${comsProject}`,
-      ...(agentName ? ["-e", `PI_AGENT_PROFILE=${agentName}`] : []),
-    ];
-
-    // Try to create the shared session; if it already exists (including the
-    // race where a parallel spawn beat us to it), add a window instead.
-    try {
-      await tmux(
-        "new-session",
-        "-d",
-        "-s",
-        subsSession,
-        "-n",
-        tmuxWindow,
-        ...envArgs,
-        piCmd,
-      );
-    } catch {
-      await tmux(
-        "new-window",
-        "-t",
-        subsSession,
-        "-n",
-        tmuxWindow,
-        ...envArgs,
-        piCmd,
-      );
-    }
-
-    const ready = await waitForComsRegistry(comsName, comsProject);
-    if (!ready) throw new Error(`subagent ${comsName} did not initialise within timeout`);
     const taskWithReporting =
       task +
       `\n\nIMPORTANT: When you have completed this task, you MUST send your result back to the parent agent using the coms_send tool with target="${parentName}". Do not skip this — it is required even for simple or short tasks. Do not just reply in chat.`;
-    await sendInitialTaskViaComs(comsName, comsProject, taskWithReporting, parentName);
 
-    const state: SubState = {
-      id,
-      task,
-      tmuxSession: subsSession,
-      tmuxWindow,
-      comsName,
-      sessionFile,
-      startedAt: Date.now(),
-    };
-    agents.set(id, state);
-    return state;
+    if (mode === "headless") {
+      // ── Headless: spawn pi --mode rpc with open stdin pipe ──────────────────
+      const logPath = makeLogFile(id);
+
+      const piArgs = [
+        "-e", comsExt,
+        "-e", widgetExt,
+        "--mode", "rpc",
+        "--cname", comsName,
+        "--project", comsProject,
+        "--session", sessionFile,
+        "--purpose", purpose,
+        ...(model ? ["--model", model] : []),
+      ];
+
+      // Strip TMUX from env and lock children to headless so the constraint
+      // propagates down the tree without any per-level special casing.
+      const childEnv: Record<string, string> = {
+        ...(process.env as Record<string, string>),
+      };
+      delete childEnv.TMUX;
+      delete childEnv.TMUX_PANE;
+      childEnv.PI_SUBAGENT_BACKEND = "headless";
+      childEnv.PI_PARENT_SESSION = parentName;
+      childEnv.PI_COMS_PROJECT = comsProject;
+      if (agentName) childEnv.PI_AGENT_PROFILE = agentName;
+
+      const logFd = fs.openSync(logPath, "w");
+      const child = spawn("pi", piArgs, {
+        detached: true,
+        stdio: ["pipe", logFd, logFd],
+        env: childEnv,
+      });
+      fs.closeSync(logFd); // close our copy; child holds its own fd
+      child.unref();
+
+      const ready = await waitForComsRegistry(comsName, comsProject);
+      if (!ready) {
+        if (process.platform !== "win32" && child.pid) {
+          try {
+            process.kill(-child.pid, "SIGTERM");
+          } catch {
+            /* ignore */
+          }
+        }
+        throw new Error(
+          `subagent ${comsName} did not initialise within timeout — log: ${logPath}`,
+        );
+      }
+
+      await sendInitialTaskViaComs(comsName, comsProject, taskWithReporting, parentName);
+
+      const state: SubState = {
+        id,
+        task,
+        comsName,
+        sessionFile,
+        startedAt: Date.now(),
+        mode: "headless",
+        pid: child.pid,
+        logPath,
+      };
+      agents.set(id, state);
+      return state;
+    } else {
+      // ── Tmux: spawn pi TUI in a detached tmux window ─────────────────────
+      const piCmd = [
+        "pi",
+        "-e", shellQuote(comsExt),
+        "-e", shellQuote(widgetExt),
+        "--cname", shellQuote(comsName),
+        "--project", shellQuote(comsProject),
+        "--session", shellQuote(sessionFile),
+        "--purpose", shellQuote(purpose),
+        ...(model ? ["--model", shellQuote(model)] : []),
+      ].join(" ");
+
+      const parentSession = await currentTmuxSession();
+      const subsSession = `${process.env.PI_COMS_NAME ?? parentSession}-subs`;
+      const tmuxWindow = comsName;
+      const envArgs = [
+        "-e", `PI_PARENT_SESSION=${parentSession}`,
+        "-e", `PI_COMS_PROJECT=${comsProject}`,
+        ...(agentName ? ["-e", `PI_AGENT_PROFILE=${agentName}`] : []),
+      ];
+
+      try {
+        await tmux(
+          "new-session", "-d", "-s", subsSession, "-n", tmuxWindow,
+          ...envArgs, piCmd,
+        );
+      } catch {
+        await tmux(
+          "new-window", "-t", subsSession, "-n", tmuxWindow,
+          ...envArgs, piCmd,
+        );
+      }
+
+      const ready = await waitForComsRegistry(comsName, comsProject);
+      if (!ready)
+        throw new Error(
+          `subagent ${comsName} did not initialise within timeout`,
+        );
+
+      await sendInitialTaskViaComs(comsName, comsProject, taskWithReporting, parentName);
+
+      const state: SubState = {
+        id,
+        task,
+        comsName,
+        sessionFile,
+        startedAt: Date.now(),
+        mode: "tmux",
+        tmuxSession: subsSession,
+        tmuxWindow,
+      };
+      agents.set(id, state);
+      return state;
+    }
   }
 
-  // ── LLM tools ─────────────────────────────────────────────────────────────
+  // ── LLM tools ──────────────────────────────────────────────────────────────
 
   pi.registerTool({
     name: "subagent_create",
     description:
-      "Spawn a background subagent in its own tmux session running a full Pi TUI. The subagent is automatically instructed to report results back to you via coms_send — do not repeat this in the task. Write the task as a natural prompt; it is delivered as the subagent's first user message. Returns the subagent ID and tmux session name.",
+      "Spawn a background subagent running a full Pi instance. In tmux environments the subagent runs as an interactive TUI; otherwise it runs headlessly. The subagent is automatically instructed to report results back to you via coms_send — do not repeat this in the task. Write the task as a natural prompt; it is delivered as the subagent's first user message. Returns the subagent ID and tmux session name.",
     parameters: Type.Object({
       task: Type.String({
-        description:
-          "The complete task description for the subagent to perform",
+        description: "The complete task description for the subagent to perform",
       }),
       purpose: Type.Optional(
         Type.String({
@@ -433,19 +590,29 @@ export default function (pi: ExtensionAPI) {
             "Model to run the subagent on, as 'provider/id' (e.g. 'openrouter/google/gemini-3-flash-preview'). Overrides the agent profile's model and the parent's model. Use this to run cheaper workers on cheaper models.",
         }),
       ),
+      headless: Type.Optional(
+        Type.Boolean({
+          description:
+            "Run the subagent headlessly (no TUI, no tmux required). Use for batch/pipeline work or when the subagent doesn't need interactive access. Defaults to true when not inside tmux, false otherwise.",
+        }),
+      ),
     }),
     execute: async (_callId, args, _signal, _onUpdate, ctx) => {
-      if (!process.env.TMUX) {
+      let backendMode: "tmux" | "headless";
+      try {
+        backendMode = resolveBackendMode(args.headless);
+      } catch (err) {
         return {
           content: [
             {
               type: "text",
-              text: "Error: not in a tmux session. subagent_create requires tmux.",
+              text: err instanceof Error ? err.message : String(err),
             },
           ],
         };
       }
-        if (args.agent && !resolveAgentFile(args.agent)) {
+
+      if (args.agent && !resolveAgentFile(args.agent)) {
         return {
           content: [
             {
@@ -455,12 +622,38 @@ export default function (pi: ExtensionAPI) {
           ],
         };
       }
-      const state = await spawnSubagent(args.task, args.purpose, args.agent, args.model, ctx);
+
+      let state: SubState;
+      try {
+        state = await spawnSubagent(
+          args.task,
+          args.purpose,
+          args.agent,
+          args.model,
+          backendMode,
+          ctx,
+        );
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Failed to spawn subagent: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+        };
+      }
+
+      const detail =
+        state.mode === "tmux"
+          ? `tmux: "${state.tmuxSession}"`
+          : `headless pid=${state.pid} · log: "${state.logPath}"`;
+
       return {
         content: [
           {
             type: "text",
-            text: `Subagent #${state.id} spawned  ·  tmux: "${state.tmuxSession}"  ·  coms: "${state.comsName}"  ·  use coms_send target="${state.comsName}" to send it messages  ·  it has been instructed to report back to you at "${process.env.PI_COMS_NAME}"`,
+            text: `Subagent #${state.id} spawned  ·  ${detail}  ·  coms: "${state.comsName}"  ·  use coms_send target="${state.comsName}" to send it messages  ·  it has been instructed to report back to you at "${process.env.PI_COMS_NAME}"`,
           },
         ],
       };
@@ -469,14 +662,19 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "subagent_list",
-    description:
-      "List all active subagents with their IDs and tmux session names.",
+    description: "List all active subagents with their IDs and session names.",
     parameters: Type.Object({}),
     execute: async () => {
       const alive: string[] = [];
       for (const s of agents.values()) {
         if (await isAlive(s)) {
-          alive.push(`#${s.id}  ${s.tmuxSession}  "${s.task}"`);
+          const detail =
+            s.mode === "tmux"
+              ? `tmux=${s.tmuxSession}`
+              : `pid=${s.pid}`;
+          alive.push(
+            `#${s.id}  [${s.mode}]  coms=${s.comsName}  ${detail}  "${s.task}"`,
+          );
         } else {
           agents.delete(s.id);
         }
@@ -488,7 +686,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── Session lifecycle ─────────────────────────────────────────────────────
+  // ── Session lifecycle ──────────────────────────────────────────────────────
 
   pi.on("session_start", async (_event, _ctx) => {
     agents.clear();
@@ -496,7 +694,6 @@ export default function (pi: ExtensionAPI) {
 
     // Scan agent profile dirs — project-local first, then global.
     // Deduplicate by name: project-local files shadow global ones.
-    const cwd = process.cwd();
     const localDefs = scanAgentDir(findProjectAgentDir() ?? "");
     const globalDefs = scanAgentDir(
       path.join(os.homedir(), ".pi", "agent", "agents"),
@@ -505,19 +702,24 @@ export default function (pi: ExtensionAPI) {
     agentDefs = [...localDefs, ...globalDefs.filter((d) => !seen.has(d.name))];
     agentsTable = buildAgentsTable(agentDefs);
 
-    // Read scoped/enabled models from settings.json for subagent spawning guidance
+    // Read scoped/enabled models from settings.json for subagent spawning guidance.
     try {
-      const settingsPath = path.join(os.homedir(), ".pi", "agent", "settings.json");
+      const settingsPath = path.join(
+        os.homedir(),
+        ".pi",
+        "agent",
+        "settings.json",
+      );
       const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
       const enabledModels: string[] = settings.enabledModels ?? [];
       if (enabledModels.length > 0) {
         const list = enabledModels.map((m: string) => `- ${m}`).join("\n");
         scopedModelsNote = `\n\n## Available Models for Subagents\nWhen spawning subagents and no agent profile specifies a model, choose only from this list:\n${list}`;
       }
-    } catch { /* settings.json missing or malformed */ }
+    } catch {
+      /* settings.json missing or malformed */
+    }
 
-    // If we were spawned as a subagent, inject a standing system-prompt
-    // instruction to always report results back via coms_send.
     const ownComsName = process.env.PI_COMS_NAME;
     const isSubagent = !!process.env.PI_PARENT_SESSION;
     const projectArgIdx = process.argv.indexOf("--project");
@@ -528,14 +730,12 @@ export default function (pi: ExtensionAPI) {
         ? projectArgVal
         : undefined;
 
-    // If spawned with a named agent profile, read + strip frontmatter once.
     const agentProfileName = process.env.PI_AGENT_PROFILE;
     let agentProfileBody: string | undefined;
     if (agentProfileName) {
       const profilePath = resolveAgentFile(agentProfileName);
       if (profilePath) {
         const raw = fs.readFileSync(profilePath, "utf8");
-        // Strip YAML frontmatter (--- ... ---) and trim leading whitespace.
         agentProfileBody = raw.replace(/^---[\s\S]*?\n---\n?/, "").trimStart();
       }
     }
@@ -559,5 +759,9 @@ export default function (pi: ExtensionAPI) {
       }
       return { systemPrompt: sp };
     });
+  });
+
+  pi.on("session_shutdown", async () => {
+    killHeadlessChildren();
   });
 }
