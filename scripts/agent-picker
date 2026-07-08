@@ -115,6 +115,12 @@ PYEOF
 
 [ -z "$agent_data" ] && exit 0
 
+# Sort by state: idle (top) → running → blocked (bottom); stable within groups
+agent_data=$(printf '%s\n' "$agent_data" | awk -F'\t' '
+  BEGIN { p["blocked"]=0; p["running"]=1; p["idle"]=2 }
+  { print p[$4] "\t" NR "\t" $0 }
+' | sort -t$'\t' -k1,1n -k2,2n | cut -f3-)
+
 # Format for fzf: NUL-delimited multi-line records
 #   line 1: icon + state + name + model·ctx suffix
 #   line 2: dim cwd
@@ -166,7 +172,7 @@ selected=$("$SELF" --list | fzf \
     --track \
     --listen 0 \
     --preview='tmux capture-pane -p -e -t {2} 2>/dev/null | head -n "$(( $(tmux display -t {2} -p "#{cursor_y}") - 2 ))"' \
-    --preview-window='right:60%:follow' \
+    --preview-window='right:60%:wrap:follow' \
     --prompt='› ' \
     --bind="start:execute-silent($SELF --tick &)" \
     --bind='focus:change-preview-window(follow)' \
