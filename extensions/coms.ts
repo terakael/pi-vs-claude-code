@@ -100,6 +100,7 @@ interface TreePingEnvelope extends Envelope {
   type: "tree_ping";
   request_id: string; // shared across one full cascade cycle
   max_depth: number; // remaining depth budget (decrements each hop)
+  sender_card?: AgentCard; // sender's own card — carries liveness + stats down the vertical channel
 }
 
 interface TreePongNode {
@@ -1821,6 +1822,16 @@ export default function (pi: ExtensionAPI) {
     // Record our parent session on the first tree_ping we receive.
     if (!myParentSessionId) myParentSessionId = env.sender_session;
 
+    // A tree_ping carries the sender's card down the vertical channel — refresh our
+    // view of the parent (fresh stats + liveness), mirroring how pong carries cards up.
+    if (env.sender_card) {
+      applyTreePongNode({
+        session_id: env.sender_session,
+        card: env.sender_card,
+        children: [],
+      });
+    }
+
     const childNodes: TreePongNode[] = [];
 
     if (env.max_depth > 0) {
@@ -1835,6 +1846,7 @@ export default function (pi: ExtensionAPI) {
           timestamp: nowIso(),
           request_id: env.request_id,
           max_depth: env.max_depth - 1,
+          sender_card: selfCard(),
         };
 
         const results = await Promise.allSettled(
@@ -1921,13 +1933,18 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * Fire-and-forget: broadcast our subtree node to all lateral peers so they
-   * can see our children without needing to ping us.
+   * Fire-and-forget: broadcast our subtree node to our lateral peers so they
+   * can see our children without needing to ping us. Direct children are
+   * excluded — they learn our liveness + card over the vertical channel (the
+   * tree_ping they receive carries our card). This keeps the two mechanisms
+   * disjoint: ping/pong is vertical, announce is lateral.
    */
   function broadcastTreeAnnounce(node: TreePongNode): void {
     if (!identity) return;
+    const childSids = new Set(directChildEntries().map((e) => e.session_id));
     const entries = readAllDisplayEntries().filter(
-      (e) => e.session_id !== identity!.session_id,
+      (e) =>
+        e.session_id !== identity!.session_id && !childSids.has(e.session_id),
     );
     const payload =
       JSON.stringify({
@@ -2006,13 +2023,16 @@ export default function (pi: ExtensionAPI) {
 
     const children = directChildEntries();
 
+    // Always announce ourselves every cycle so children (and lateral peers) keep
+    // our card fresh. We announce with empty children — subtree data reaches peers
+    // independently via their own pong/announce handling.
+    broadcastTreeAnnounce({
+      session_id: identity.session_id,
+      card: selfCard(),
+      children: [],
+    });
+
     if (children.length === 0) {
-      // Flat peer / leaf root — announce ourselves so peers know we're alive.
-      broadcastTreeAnnounce({
-        session_id: identity.session_id,
-        card: selfCard(),
-        children: [],
-      });
       return;
     }
 
@@ -2026,6 +2046,7 @@ export default function (pi: ExtensionAPI) {
       timestamp: nowIso(),
       request_id: requestId,
       max_depth: TREE_PING_MAX_DEPTH,
+      sender_card: selfCard(),
     };
 
     const results = await Promise.allSettled(
