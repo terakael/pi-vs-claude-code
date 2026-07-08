@@ -16,7 +16,7 @@ export default function (pi: ExtensionAPI) {
 
     const command = event.input.command as string;
     const needsPermission = restrictedPatterns.some((pattern) =>
-      new RegExp(`(^|[|&;]\\s*)\\s*` + pattern.source).test(command),
+      new RegExp(`(^|[|&;\\n]\\s*)\\s*` + pattern.source).test(command),
     );
 
     if (needsPermission) {

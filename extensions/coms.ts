@@ -43,6 +43,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import * as crypto from "node:crypto";
 import { pickLevelOneName } from "./naming.ts";
+import { complete } from "@earendil-works/pi-ai/compat";
 
 // ━━ Constants ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -725,6 +726,7 @@ export default function (pi: ExtensionAPI) {
   let extraProjects: string[] = [];
   let currentCtx: ExtensionContext | null = null;
   let currentInbound: InboundContext | null = null;
+  let firstTurnDone = false;
   let selectedIndex = -1;
   let widgetVisible = true;
   let agentRunning = false;
@@ -1143,6 +1145,20 @@ export default function (pi: ExtensionAPI) {
     const effective = closing
       ? { running: false, blocked: false }
       : recomputeEffective();
+    // Surface state to the tmux pane so agent-picker can show running/idle/blocked.
+    const pane = process.env.TMUX_PANE;
+    if (pane) {
+      const paneState = effective.blocked
+        ? "blocked"
+        : effective.running
+          ? "running"
+          : "idle";
+      try {
+        spawnSync("tmux", ["set-option", "-p", "-t", pane, "@agent_state", paneState]);
+      } catch {
+        /* best-effort */
+      }
+    }
     const ctx = currentCtx;
     const selfCard: AgentCard = {
       name: identity.name,
@@ -1435,6 +1451,7 @@ export default function (pi: ExtensionAPI) {
       tmux_pane: tmuxPane,
     };
     includeExplicit = false;
+    firstTurnDone = false;
     extraProjects = namedProject ? [namedProject] : [];
     // Expose identity so co-loaded extensions (subagent-widget etc.) can read it.
     process.env.PI_COMS_PROJECT = name;
@@ -2722,7 +2739,115 @@ export default function (pi: ExtensionAPI) {
     agentRunning = false;
     broadcastStatus(false);
     updateSpinnerTimer();
+    if (!firstTurnDone) {
+      firstTurnDone = true;
+      if (!identity.purpose) {
+        void autoSetPurpose();
+      }
+    }
   });
+
+  async function autoSetPurpose(): Promise<void> {
+    if (!identity || !currentCtx) return;
+
+    // Build a minimal prompt from the first user+assistant exchange.
+    const branch = currentCtx.sessionManager.getBranch();
+    const parts: string[] = [];
+    for (const entry of branch) {
+      if (entry.type !== "message" || !entry.message?.role) continue;
+      const role: string = entry.message.role;
+      if (role !== "user" && role !== "assistant") continue;
+      const content = entry.message.content;
+      const text =
+        typeof content === "string"
+          ? content
+          : Array.isArray(content)
+            ? content
+                .filter((c: any) => c?.type === "text")
+                .map((c: any) => c.text as string)
+                .join(" ")
+            : "";
+      if (text.trim()) parts.push(`${role === "user" ? "User" : "Assistant"}: ${text.trim()}`);
+      if (parts.length >= 2) break; // first user + first assistant reply is enough
+    }
+    if (parts.length === 0) return;
+
+    const prompt =
+      "Write a 4–7 word task label describing what is being worked on. " +
+      "Use an imperative verb phrase (e.g. 'Refactor auth module', 'Debug login failure', 'Write tests for payment service'). " +
+      "Output ONLY the label. No punctuation at the end. No preamble.\n\n" +
+      parts.join("\n\n");
+
+    // Try cheap models in preference order.
+    const candidates = [
+      { provider: "rakuten-gemini", id: "gemini-3.5-flash" },
+      { provider: "rakuten-bedrock", id: "us.anthropic.claude-haiku-4-5-20251001-v1:0" },
+      { provider: "amazon-bedrock", id: "us.anthropic.claude-haiku-4-5-20251001-v1:0" },
+      { provider: "anthropic", id: "claude-haiku-4-5" },
+    ];
+
+    for (const { provider, id } of candidates) {
+      const model = currentCtx.modelRegistry.find(provider, id);
+      if (!model) continue;
+      const auth = await currentCtx.modelRegistry.getApiKeyAndHeaders(model);
+      if (!auth?.ok) continue;
+
+      try {
+        const response = await complete(
+          model,
+          {
+            messages: [
+              {
+                role: "user" as const,
+                content: [{ type: "text" as const, text: prompt }],
+                timestamp: Date.now(),
+              },
+            ],
+          },
+          { apiKey: auth.apiKey, headers: auth.headers, env: auth.env, maxTokens: 64 },
+        );
+
+        const sentence = response.content
+          .filter((c): c is { type: "text"; text: string } => c.type === "text")
+          .map((c) => c.text)
+          .join(" ")
+          .trim();
+
+        if (!sentence) return;
+
+        // Update identity + registry.
+        identity.purpose = sentence;
+        const ctx = currentCtx;
+        const live: RegistryEntry = {
+          session_id: identity.session_id,
+          name: identity.name,
+          purpose: sentence,
+          model: ctx?.model?.name ?? ctx?.model?.id ?? identity.model,
+          color: identity.color,
+          pid: process.pid,
+          endpoint: identity.endpoint,
+          cwd: identity.cwd,
+          started_at: nowIso(),
+          explicit: identity.explicit,
+          version: 1,
+          context_used_pct: Math.round(ctx?.getContextUsage()?.percent ?? 0),
+          heartbeat_at: nowIso(),
+          tmux_session: identity.tmux_session,
+          tmux_window: identity.tmux_window,
+          tmux_pane: identity.tmux_pane,
+        };
+        for (const p of allProjects()) {
+          try { writeRegistryAtomic(live, p); } catch { /* best-effort */ }
+        }
+        // Announce the updated card to peers.
+        void broadcastStatus(false);
+        host.requestRender();
+      } catch {
+        // best-effort — if it fails, no purpose is set
+      }
+      return; // tried at least one model
+    }
+  }
 
   // ━━ /coms slash command ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   pi.registerCommand("coms", {
