@@ -653,7 +653,7 @@ export default function (pi: ExtensionAPI) {
         content: [
           {
             type: "text",
-            text: `Subagent #${state.id} spawned  ·  ${detail}  ·  coms: "${state.comsName}"  ·  use coms_send target="${state.comsName}" to send it messages  ·  it has been instructed to report back to you at "${process.env.PI_COMS_NAME}"`,
+            text: `Subagent #${state.id} spawned  ·  ${detail}  ·  coms: "${state.comsName}"  ·  use coms_send target="${state.comsName}" to send it messages  ·  it will report back to you at "${process.env.PI_COMS_NAME}" when done. Do not sleep, poll, or wait for its reply — you'll be automatically resumed when it responds. Continue with other work or end your turn.`,
           },
         ],
       };
@@ -747,6 +747,9 @@ export default function (pi: ExtensionAPI) {
       }
       if (isSubagent) {
         sp += ` You are a subagent. When you have completed your task, you MUST send your result back to your parent agent using the coms_send tool with target="${parentComsName}". Do not finish without doing this.`;
+      }
+      if (!isSubagent) {
+        sp += `\n\n## Directory Exploration & Recon\n\nWhen you are asked to explore, scan, or map out directories, search across the codebase, or do any broad recon (finding files, grepping, understanding structure), prefer spawning a subagent to do it rather than exploring directly. Work from the subagent's reported findings. This keeps large directory listings and file contents out of your own context window. If a suitable specialist agent (such as a scout/recon profile) is listed below, delegate to it.`;
       }
       if (agentProfileBody) {
         sp += `\n\n## Agent Profile: ${agentProfileName}\n\n${agentProfileBody}`;

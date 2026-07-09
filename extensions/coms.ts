@@ -1156,6 +1156,7 @@ export default function (pi: ExtensionAPI) {
           : "idle";
       try {
         spawnSync("tmux", ["set-option", "-p", "-t", pane, "@agent_state", paneState]);
+        spawnSync("tmux", ["set-option", "-p", "-t", pane, "@agent_state_changed", String(Math.floor(Date.now() / 1000))]);
       } catch {
         /* best-effort */
       }

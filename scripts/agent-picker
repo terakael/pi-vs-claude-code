@@ -67,7 +67,7 @@ for f in glob.glob(os.path.join(coms_dir, 'projects', '*', 'agents', '*.json')):
 # Get all tmux pane metadata
 r = subprocess.run(
     ['tmux', 'list-panes', '-a', '-F',
-     '#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{window_name}\t#{pane_pid}\t#{@agent_state}\t#{pane_current_path}'],
+     '#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{window_name}\t#{pane_pid}\t#{@agent_state}\t#{pane_current_path}\t#{@agent_state_changed}'],
     capture_output=True, text=True
 )
 
@@ -94,6 +94,7 @@ for line in r.stdout.splitlines():
     if len(parts) < 7:
         continue
     pane_id, session, win, pane, wname, shell_pid, state = parts[:7]
+    state_changed = parts[8] if len(parts) > 8 else ''
 
     entry = coms_map.get(pane_id)
     if not entry:
@@ -109,7 +110,7 @@ for line in r.stdout.splitlines():
 
     cwd = pretty_path(parts[7]) if len(parts) > 7 else ''
 
-    print(f"{pane_id}\t{session}:{win}.{pane}\t{name}\t{state}\t{model}\t{ctx}\t{cwd}\t{purpose}")
+    print(f"{pane_id}\t{session}:{win}.{pane}\t{name}\t{state}\t{model}\t{ctx}\t{cwd}\t{purpose}\t{state_changed}")
 PYEOF
 )
 
@@ -118,8 +119,8 @@ PYEOF
 # Sort by state: idle (top) → running → blocked (bottom); stable within groups
 agent_data=$(printf '%s\n' "$agent_data" | awk -F'\t' '
   BEGIN { p["blocked"]=0; p["running"]=1; p["idle"]=2 }
-  { print p[$4] "\t" NR "\t" $0 }
-' | sort -t$'\t' -k1,1n -k2,2n | cut -f3-)
+  { ts = ($9+0 > 0) ? $9+0 : 0; print p[$4] "\t" ts "\t" NR "\t" $0 }
+' | sort -t$'\t' -k1,1n -k2,2nr -k3,3n | cut -f4-)
 
 # Format for fzf: NUL-delimited multi-line records
 #   line 1: icon + state + name + model·ctx suffix
