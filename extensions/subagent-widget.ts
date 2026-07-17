@@ -567,7 +567,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent_create",
     description:
-      "Spawn a background subagent running a full Pi instance. In tmux environments the subagent runs as an interactive TUI; otherwise it runs headlessly. The subagent is automatically instructed to report results back to you via coms_send — do not repeat this in the task. Write the task as a natural prompt; it is delivered as the subagent's first user message. Returns the subagent ID and tmux session name.",
+      "Spawn a background subagent running a full Pi instance. In tmux environments the subagent runs as an interactive TUI; otherwise it runs headlessly. The subagent is automatically instructed to report results back to you via coms_send — do not repeat this in the task. Write the task as a natural prompt; it is delivered as the subagent's first user message. Returns the subagent ID and tmux session name. Backend mode is determined by the environment — do not try to control it.",
     parameters: Type.Object({
       task: Type.String({
         description: "The complete task description for the subagent to perform",
@@ -590,17 +590,11 @@ export default function (pi: ExtensionAPI) {
             "Model to run the subagent on, as 'provider/id' (e.g. 'openrouter/google/gemini-3-flash-preview'). Overrides the agent profile's model and the parent's model. Use this to run cheaper workers on cheaper models.",
         }),
       ),
-      headless: Type.Optional(
-        Type.Boolean({
-          description:
-            "Run the subagent headlessly (no TUI, no tmux required). Use for batch/pipeline work or when the subagent doesn't need interactive access. Defaults to true when not inside tmux, false otherwise.",
-        }),
-      ),
     }),
     execute: async (_callId, args, _signal, _onUpdate, ctx) => {
       let backendMode: "tmux" | "headless";
       try {
-        backendMode = resolveBackendMode(args.headless);
+        backendMode = resolveBackendMode();
       } catch (err) {
         return {
           content: [
